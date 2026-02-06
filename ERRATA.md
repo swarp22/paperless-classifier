@@ -136,3 +136,19 @@ Anthropic hat zwei Cache-Write-Stufen eingeführt:
 `ModelPricing` hat jetzt `cache_write_5m_per_mtok` und `cache_write_1h_per_mtok` statt eines einzelnen `cache_write_per_mtok`. `calculate_cost()` akzeptiert `cache_ttl="5m"|"1h"`.
 
 **Änderung in config.py (durchgeführt):** `schema_matrix_model` von `claude-opus-4-5-20251101` auf `claude-opus-4-6` geändert. Gleiches Preisniveau, neueres Modell. Beide bleiben in der Preistabelle hinterlegt.
+
+---
+
+## E-008: Error-Handling – Tag "NEU" wird bei Fehler entfernt (AP-05, 2026-02-06)
+
+**Betrifft:** `app/classifier/pipeline.py` (`_set_error_status`), Design-Dokument Abschnitt 13.8
+
+**Vorher (Design + AP-04):** Bei Verarbeitungsfehlern blieb Tag "NEU" erhalten (`ki_status=error`), damit automatischer Retry möglich war.
+
+**Problem:** Der Poller erkennt Dokumente ausschließlich über Tag "NEU" (kein ki_status-Filter). Ein errored Dokument mit NEU-Tag würde bei jedem Polling-Zyklus erneut verarbeitet → Endlosschleife mit API-Kosten.
+
+**Entscheidung:** Tag "NEU" ist der einzige Trigger. `ki_status` ist reine Statusinformation für den Nutzer. Bei Error wird NEU entfernt und `ki_status=error` gesetzt. Retry durch manuelles Hinzufügen des NEU-Tags.
+
+**Geändert in:** `_set_error_status()` entfernt jetzt Tag "NEU" (ID 12) zusätzlich zu `ki_status=error`. Die zwei Operationen (ki_status setzen, Tag entfernen) sind separat in try/except gefasst, damit ein Teilfehler nicht die andere Operation verhindert.
+
+**Auswirkung:** Kein automatischer Retry mehr. Fehlerhafte Dokumente sind über einen Paperless-Filter `ki_status=error` auffindbar. Der Safety-Check (`ki_status=null` ohne Tag-Filter) aus dem Design-Dokument ist für Phase 1 nicht implementiert, weil er beim ersten Lauf alle Bestandsdokumente finden würde. Kann in einem späteren AP mit SQLite-State nachgerüstet werden.

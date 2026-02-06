@@ -554,9 +554,11 @@ class ClassificationPipeline:
                     )
 
     async def _set_error_status(self, document_id: int) -> None:
-        """Setzt ki_status = "error" bei Verarbeitungsfehlern.
+        """Setzt ki_status = "error" und entfernt Tag "NEU" bei Verarbeitungsfehlern.
 
-        Tag "NEU" bleibt bewusst erhalten, damit ein Retry möglich ist.
+        Tag "NEU" wird entfernt, damit der Poller das Dokument nicht endlos
+        erneut versucht.  Retry ist jederzeit möglich, indem der Nutzer den
+        NEU-Tag manuell wieder zuweist.
         """
         try:
             await self._paperless.set_custom_field_by_label(
@@ -564,8 +566,24 @@ class ClassificationPipeline:
             )
             logger.info("ki_status='error' gesetzt: Dokument %d", document_id)
         except Exception as exc:
-            # Wenn selbst das Fehler-Setzen fehlschlägt, nur loggen
             logger.error(
                 "Konnte ki_status='error' nicht setzen für Dokument %d: %s",
+                document_id, exc,
+            )
+
+        # Tag "NEU" entfernen – separat gefangen, damit ki_status auch bei
+        # Tag-Fehler gesetzt bleibt
+        try:
+            doc = await self._paperless.get_document(document_id)
+            current_tags = set(doc.tags)
+            if TAG_NEU_ID in current_tags:
+                current_tags.discard(TAG_NEU_ID)
+                await self._paperless.update_document(
+                    document_id, tags=sorted(current_tags),
+                )
+                logger.info("Tag 'NEU' entfernt (Error): Dokument %d", document_id)
+        except Exception as exc:
+            logger.error(
+                "Konnte Tag 'NEU' nicht entfernen für Dokument %d: %s",
                 document_id, exc,
             )

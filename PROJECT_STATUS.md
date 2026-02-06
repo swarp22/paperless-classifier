@@ -3,7 +3,7 @@
 Dieses Dokument dient als Chat-übergreifender Kontext für die Entwicklung
 mit Claude. Es wird nach jedem abgeschlossenen Arbeitspaket aktualisiert.
 
-**Letzte Aktualisierung:** 2026-02-06, nach AP-04
+**Letzte Aktualisierung:** 2026-02-06, nach AP-05
 
 ---
 
@@ -57,15 +57,34 @@ mit Claude. Es wird nach jedem abgeschlossenen Arbeitspaket aktualisiert.
 - `app/classifier/pipeline.py`: 10-Schritte-Orchestrierung (Design-Dokument Abschnitt 6)
   - Dependency Injection (PaperlessClient, ClaudeClient, PipelineConfig)
   - System-Prompt-Caching, Neuanlage-Handling, Fehler-Recovery
+  - Nachträgliche Änderung (AP-05): `_set_error_status()` entfernt jetzt Tag "NEU" bei Fehlern (ERRATA E-008)
 - Keine neuen Dependencies außer PyMuPDF (bereits in requirements.txt)
+
+### AP-05: Poller & Scheduler ✓
+- `app/scheduler/poller.py`: asyncio-basierter Polling-Loop
+  - Dokumenterkennung über Tag "NEU" (ID 12) als einziger Trigger
+  - Sequenzielle Verarbeitung (ein Dokument nach dem anderen)
+  - Fehler stoppen den Loop nicht (NEU wird entfernt, ki_status=error)
+  - Kostenlimit-Prüfung vor jedem Dokument mit Auto-Pause
+  - Start/Stop/Pause-Steuerung für zukünftige Web-UI
+  - Status-Tracking: PollerState, PollerStatus (Dataclass)
+- `app/scheduler/webhook.py`: Stub-Endpoint `/api/webhook` (Phase 2, NotImplementedError)
+- `app/scheduler/__init__.py`: Modul-Exporte (Poller, PollerState, PollerStatus)
+- `app/main.py`: Komplette Lifecycle-Integration
+  - async_startup(): PaperlessClient → Cache laden → ClaudeClient → Pipeline → Poller starten
+  - shutdown(): Poller → ClaudeClient → PaperlessClient (graceful, in Reihenfolge)
+  - Health-Check um Poller-Status erweitert
+  - Getter-Funktionen für Laufzeit-Objekte (get_poller, get_pipeline, get_cost_tracker)
+- `app/classifier/pipeline.py`: _set_error_status entfernt jetzt NEU-Tag (ERRATA E-008)
+- Keine neuen Dependencies
 
 ## Nächstes Arbeitspaket
 
-**AP-05: Poller & Scheduler**
-- Polling-basierte Dokumenterkennung (Tag "NEU" / ki_status=null)
-- asyncio-Task mit konfigurierbarem Intervall
-- Webhook-Endpunkt (optional, Phase 2)
-- Integration mit ClassificationPipeline
+**AP-06: Web-UI Basis**
+- NiceGUI-Grundgerüst mit Navigation
+- Dashboard (Poller-Status, letzte Verarbeitungen)
+- Einstellungsseite (Verbindungen, Modell, Modus, Routing-Regeln)
+- Log-Viewer
 
 ## Konfiguration (config.py – aktuelle Werte)
 
@@ -74,6 +93,8 @@ default_model = "claude-sonnet-4-5-20250929"
 batch_model = "claude-sonnet-4-5-20250929"
 schema_matrix_model = "claude-opus-4-6"        # geändert von opus-4-5, siehe ERRATA E-007
 monthly_cost_limit_usd = 25.0
+polling_interval_seconds = 300                  # 5 Minuten
+processing_mode = "immediate"
 ```
 
 ## Paperless-Stammdaten (Kurzfassung)
@@ -87,7 +108,7 @@ monthly_cost_limit_usd = 25.0
 paperless-classifier/
 ├── app/
 │   ├── __init__.py
-│   ├── main.py                    # NiceGUI Einstiegspunkt
+│   ├── main.py                    # NiceGUI Einstiegspunkt + Lifecycle
 │   ├── config.py                  # Pydantic Settings
 │   ├── logging_config.py          # Logging-Konfiguration
 │   ├── claude/                    # AP-03
@@ -101,20 +122,50 @@ paperless-classifier/
 │   │   ├── resolver.py            # Name→ID Mapping (Fuzzy)
 │   │   ├── confidence.py          # Confidence-Bewertung
 │   │   └── pipeline.py            # Orchestrierung (10-Schritte-Flow)
-│   └── paperless/                 # AP-02
-│       ├── __init__.py
-│       ├── cache.py
-│       ├── client.py
-│       ├── exceptions.py
-│       └── models.py
+│   ├── scheduler/                 # AP-05
+│   │   ├── __init__.py            # Modul-Exporte
+│   │   ├── poller.py              # Polling-Loop (asyncio Background-Task)
+│   │   └── webhook.py             # Webhook-Endpoint (Stub, Phase 2)
+│   ├── paperless/                 # AP-02
+│   │   ├── __init__.py
+│   │   ├── cache.py
+│   │   ├── client.py
+│   │   ├── exceptions.py
+│   │   └── models.py
+│   ├── db/                        # Vorbereitet (leer)
+│   ├── schema_matrix/             # Vorbereitet (leer)
+│   └── ui/                        # Vorbereitet (leer)
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
 ├── .env.example
 ├── .gitignore
-├── ERRATA.md                      # Abweichungen zur Design-Doku
+├── ERRATA.md                      # Abweichungen zur Design-Doku (E-001 bis E-008)
 ├── PROJECT_STATUS.md              # ← Dieses Dokument
 └── README.md
+```
+
+## Architektur-Überblick (nach AP-05)
+
+```
+Container-Start
+  │
+  ├─ startup()          Logging + Config (synchron)
+  │
+  ├─ async_startup()    PaperlessClient → Cache → ClaudeClient → Pipeline → Poller
+  │    │
+  │    └─ Poller.start()
+  │         │
+  │         └─ _run_loop()          ← asyncio Background-Task
+  │              │
+  │              ├─ get_documents(tags=[12])   Tag "NEU"
+  │              ├─ pipeline.classify_document(doc_id)
+  │              ├─ sleep(polling_interval)
+  │              └─ ... (Endlosschleife)
+  │
+  ├─ NiceGUI/Uvicorn    Web-UI + /health + /api/webhook (Stub)
+  │
+  └─ shutdown()         Poller.stop() → ClaudeClient → PaperlessClient
 ```
 
 ## Referenzen
