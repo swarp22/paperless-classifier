@@ -3,7 +3,7 @@
 Dieses Dokument dient als Chat-übergreifender Kontext für die Entwicklung
 mit Claude. Es wird nach jedem abgeschlossenen Arbeitspaket aktualisiert.
 
-**Letzte Aktualisierung:** 2026-02-06, nach AP-03
+**Letzte Aktualisierung:** 2026-02-06, nach AP-04
 
 ---
 
@@ -46,13 +46,26 @@ mit Claude. Es wird nach jedem abgeschlossenen Arbeitspaket aktualisiert.
 - Preistabelle aktualisiert: Opus 4.5 = $5/$25 statt $15/$75 (ERRATA E-007)
 - Cache Write mit zwei Stufen: 5min (ephemeral) und 1h
 
+### AP-04: Classifier Core ✓
+- `app/classifier/model_router.py`: Lokale PDF-Analyse (PyMuPDF), Modellwahl (Sonnet/Haiku)
+- `app/classifier/resolver.py`: Name→ID Mapping mit Fuzzy-Matching (difflib, Threshold 0.85)
+  - Select-Option-Auflösung für Custom Fields (ERRATA E-001)
+  - Steuer-Tag-Ableitung aus tax_relevant + tax_year
+  - Neuanlage-Tracking (create_new aus Claude-Antwort)
+- `app/classifier/confidence.py`: Gewichtete Confidence-Bewertung (4 Signale)
+  - HIGH → auto_apply (ki_status=classified), MEDIUM → apply_review, LOW → review_only
+- `app/classifier/pipeline.py`: 10-Schritte-Orchestrierung (Design-Dokument Abschnitt 6)
+  - Dependency Injection (PaperlessClient, ClaudeClient, PipelineConfig)
+  - System-Prompt-Caching, Neuanlage-Handling, Fehler-Recovery
+- Keine neuen Dependencies außer PyMuPDF (bereits in requirements.txt)
+
 ## Nächstes Arbeitspaket
 
-**AP-04: Classifier Core**
-- Classifier-Pipeline (Orchestrierung)
-- Model Router (`classifier/model_router.py`) – verschoben aus AP-03
-- LookupCache-Integration (Stammdaten → Prompt)
-- PyMuPDF-Dependency für PDF-Analyse (Seitenzahl, Scan-Erkennung)
+**AP-05: Poller & Scheduler**
+- Polling-basierte Dokumenterkennung (Tag "NEU" / ki_status=null)
+- asyncio-Task mit konfigurierbarem Intervall
+- Webhook-Endpunkt (optional, Phase 2)
+- Integration mit ClassificationPipeline
 
 ## Konfiguration (config.py – aktuelle Werte)
 
@@ -76,14 +89,24 @@ paperless-classifier/
 │   ├── __init__.py
 │   ├── main.py                    # NiceGUI Einstiegspunkt
 │   ├── config.py                  # Pydantic Settings
+│   ├── logging_config.py          # Logging-Konfiguration
 │   ├── claude/                    # AP-03
 │   │   ├── __init__.py
 │   │   ├── client.py
 │   │   ├── cost_tracker.py
 │   │   └── prompts.py
+│   ├── classifier/                # AP-04
+│   │   ├── __init__.py
+│   │   ├── model_router.py        # PDF-Analyse + Modellwahl
+│   │   ├── resolver.py            # Name→ID Mapping (Fuzzy)
+│   │   ├── confidence.py          # Confidence-Bewertung
+│   │   └── pipeline.py            # Orchestrierung (10-Schritte-Flow)
 │   └── paperless/                 # AP-02
 │       ├── __init__.py
-│       └── client.py
+│       ├── cache.py
+│       ├── client.py
+│       ├── exceptions.py
+│       └── models.py
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
