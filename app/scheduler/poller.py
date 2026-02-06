@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING
 
 from app.classifier.pipeline import ClassificationPipeline, PipelineResult
 from app.classifier.resolver import TAG_NEU_ID
-from app.claude.client import CostLimitReachedError
+from app.claude.client import ClaudeAPIError, CostLimitReachedError
 from app.logging_config import get_logger
 
 if TYPE_CHECKING:
@@ -29,6 +29,11 @@ if TYPE_CHECKING:
     from app.paperless.client import PaperlessClient
 
 logger = get_logger("scheduler")
+
+# Pause zwischen zwei aufeinanderfolgenden Dokumenten (Sekunden).
+# Verhindert Rate-Limit-Fehler bei Batch-Verarbeitung (z.B. initialer Import).
+# Im Normalbetrieb (1-3 Dokumente pro Zyklus) vernachlässigbar.
+DOCUMENT_DELAY_SECONDS = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +269,7 @@ class Poller:
 
         run_results: list[PipelineResult] = []
 
-        for doc in documents:
+        for i, doc in enumerate(documents):
             # Vor jedem Dokument: Stop/Pause prüfen
             if self._stop_event.is_set():
                 logger.info("Stop-Signal empfangen – breche Verarbeitung ab")
@@ -280,6 +285,13 @@ class Poller:
                     "Kostenlimit erreicht – verbleibende Dokumente werden übersprungen"
                 )
                 break
+
+            # Delay zwischen Dokumenten (nicht vor dem ersten)
+            if i > 0:
+                logger.debug(
+                    "Warte %.1fs vor nächstem Dokument", DOCUMENT_DELAY_SECONDS,
+                )
+                await asyncio.sleep(DOCUMENT_DELAY_SECONDS)
 
             # Dokument verarbeiten
             self.status.state = PollerState.PROCESSING
@@ -308,6 +320,32 @@ class Poller:
                     logger.warning(
                         "Dokument %d fehlgeschlagen: %s", doc.id, result.error,
                     )
+
+            except ClaudeAPIError as exc:
+                if exc.status_code in (429, 529):
+                    # Rate-Limit oder Überlast: Zyklus abbrechen.
+                    # Das Dokument wurde NICHT als Error markiert (Pipeline
+                    # hat re-raised), NEU-Tag bleibt, ki_status bleibt null.
+                    # Beim nächsten Zyklus wird es erneut versucht.
+                    remaining = len(documents) - i - 1
+                    logger.warning(
+                        "Rate-Limit (HTTP %d) bei Dokument %d – "
+                        "Zyklus wird abgebrochen, %d Dokument(e) verbleiben "
+                        "für nächsten Zyklus",
+                        exc.status_code, doc.id, remaining,
+                    )
+                    self.status.last_error = (
+                        f"Rate-Limit bei Dokument {doc.id} (HTTP {exc.status_code})"
+                    )
+                    break
+                # Andere ClaudeAPIErrors (nicht 429/529) sollten nicht hier
+                # landen (Pipeline fängt sie ab), aber für den Fall:
+                self.status.documents_errored += 1
+                self.status.last_error = f"Dokument {doc.id}: {exc}"
+                logger.exception(
+                    "Unerwarteter Claude-Fehler bei Dokument %d: %s",
+                    doc.id, exc,
+                )
 
             except CostLimitReachedError:
                 # Pipeline hat CostLimitReachedError geworfen –

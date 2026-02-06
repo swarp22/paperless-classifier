@@ -45,6 +45,7 @@ from app.classifier.resolver import (
 )
 from app.claude.client import (
     ClassificationResponse,
+    ClaudeAPIError,
     ClaudeClient,
     ClaudeError,
     ConfidenceLevel,
@@ -261,6 +262,19 @@ class ClassificationPipeline:
             await self._set_error_status(document_id)
 
         except ClaudeError as exc:
+            # Rate-Limit (429) oder Server-Überlast (529): Dokument NICHT als
+            # Error markieren – NEU-Tag bleibt, ki_status bleibt null.
+            # Exception wird an den Poller weitergereicht, der den Zyklus abbricht.
+            if isinstance(exc, ClaudeAPIError) and exc.status_code in (429, 529):
+                logger.warning(
+                    "Rate-Limit/Überlast bei Dokument %d (HTTP %d) – "
+                    "Dokument bleibt unverändert für nächsten Zyklus",
+                    document_id, exc.status_code,
+                )
+                result.error = str(exc)
+                result.error_type = "RateLimitError"
+                raise
+
             result.error = str(exc)
             result.error_type = type(exc).__name__
             logger.error(
@@ -464,6 +478,11 @@ class ClassificationPipeline:
     ) -> None:
         """Wendet das Klassifizierungsergebnis auf das Paperless-Dokument an.
 
+        Alle Änderungen (Metadaten, Tags, Custom Fields) werden in einem
+        einzigen PATCH-Aufruf gesendet.  Das verhindert Race Conditions,
+        bei denen nachfolgende PATCHes den Tag-Zustand aus einem vorherigen
+        PATCH überschreiben, bevor Paperless ihn vollständig committet hat.
+
         Je nach Confidence-Level werden Felder gesetzt oder nicht:
         - HIGH:   Alles anwenden, ki_status = "classified"
         - MEDIUM: Alles anwenden, ki_status = "review"
@@ -471,11 +490,29 @@ class ClassificationPipeline:
 
         In allen Fällen wird Tag "NEU" entfernt.
         """
-        # PATCH-Payload zusammenbauen
+        cache = self._paperless.cache
         patch: dict[str, Any] = {}
 
+        # --- Tags: In jedem Fall NEU entfernen ---
+        current_tags = set(doc.tags)
+        current_tags.discard(TAG_NEU_ID)
+
+        # --- Custom Fields: Bestehende übernehmen, dann gezielt ändern ---
+        # Wir bauen die komplette custom_fields-Liste selbst, statt
+        # mehrere Einzel-PATCHes zu machen.  So sendet Paperless nur
+        # einen einzigen DB-Write.
+        cf_map: dict[int, Any] = {
+            cf.field: cf.value for cf in doc.custom_fields
+        }
+
+        # ki_status immer setzen (Label → Option-ID über Cache)
+        ki_status_option_id = cache.require_select_option_id(
+            CF_KI_STATUS, confidence.ki_status,
+        )
+        cf_map[CF_KI_STATUS] = ki_status_option_id
+
         if confidence.should_apply_fields:
-            # Titel immer setzen (wenn vorhanden)
+            # Titel
             if resolved.title:
                 patch["title"] = resolved.title
 
@@ -495,63 +532,58 @@ class ClassificationPipeline:
             if resolved.date:
                 patch["created_date"] = resolved.date
 
-            # Tags: Bestehende Tags beibehalten, NEU entfernen,
-            # neue Tags hinzufügen
-            current_tags = set(doc.tags)
-            current_tags.discard(TAG_NEU_ID)       # "NEU" entfernen
-            current_tags.update(resolved.tag_ids)   # Neue Tags hinzufügen
-            patch["tags"] = sorted(current_tags)
+            # Neue Tags hinzufügen
+            current_tags.update(resolved.tag_ids)
+
+            # Aufgelöste Custom Fields setzen (z.B. Person)
+            for cf in resolved.custom_fields:
+                if cf.resolved and cf.value is not None:
+                    cf_map[cf.field_id] = cf.value
+                    logger.debug(
+                        "Custom Field %d gesetzt: %s", cf.field_id, cf.value,
+                    )
+
+            # Paginierung: Bei digitalem PDF das Feld entfernen
+            raw = resolved.raw_result
+            if raw and not raw.is_scanned_document and raw.pagination_stamp is None:
+                existing_val = doc.get_custom_field_value(CF_PAGINIERUNG)
+                if existing_val is not None:
+                    cf_map.pop(CF_PAGINIERUNG, None)
+                    logger.debug(
+                        "Paginierung entfernt (digitales Dokument): Dokument %d",
+                        document_id,
+                    )
+
+            # Haus-Felder: Bei digitalem PDF ebenfalls entfernen.
+            # Digitale Dokumente werden nicht physisch im Haus-Ordner abgelegt
+            # (Design-Dok 13.6.1).
+            if raw and not raw.is_scanned_document:
+                for cf_id in (CF_HAUS_REGISTER, CF_HAUS_ORDNUNGSZAHL):
+                    existing_val = doc.get_custom_field_value(cf_id)
+                    if existing_val is not None:
+                        cf_map.pop(cf_id, None)
+                        logger.debug(
+                            "Haus-Feld %d entfernt (digitales Dokument): Dokument %d",
+                            cf_id, document_id,
+                        )
 
             logger.info(
                 "Felder anwenden: Dokument %d, confidence=%s",
                 document_id, confidence.level.value,
             )
         else:
-            # LOW confidence: Nur Tag "NEU" entfernen, sonst nichts
-            current_tags = set(doc.tags)
-            current_tags.discard(TAG_NEU_ID)
-            patch["tags"] = sorted(current_tags)
             logger.info(
                 "Felder NICHT anwenden (low confidence): Dokument %d",
                 document_id,
             )
 
-        # PATCH ausführen (Tags + ggf. Felder)
-        if patch:
-            await self._paperless.update_document(document_id, **patch)
+        # --- Alles in einem einzigen PATCH senden ---
+        patch["tags"] = sorted(current_tags)
+        patch["custom_fields"] = [
+            {"field": fid, "value": val} for fid, val in cf_map.items()
+        ]
 
-        # Custom Fields einzeln setzen (müssen separat gepatcht werden,
-        # weil update_document() bei custom_fields alles überschreibt)
-
-        # ki_status setzen
-        await self._paperless.set_custom_field_by_label(
-            document_id, CF_KI_STATUS, confidence.ki_status,
-        )
-
-        if confidence.should_apply_fields:
-            # Person setzen (wenn aufgelöst)
-            for cf in resolved.custom_fields:
-                if cf.resolved and cf.value is not None:
-                    await self._paperless.set_custom_field(
-                        document_id, cf.field_id, cf.value,
-                    )
-                    logger.debug(
-                        "Custom Field %d gesetzt: %s", cf.field_id, cf.value,
-                    )
-
-            # Paginierung: Bei digitalem PDF das Feld entfernen (Design-Dok 13.7)
-            raw = resolved.raw_result
-            if raw and not raw.is_scanned_document and raw.pagination_stamp is None:
-                # Feld entfernen falls es existiert
-                existing_val = doc.get_custom_field_value(CF_PAGINIERUNG)
-                if existing_val is not None:
-                    await self._paperless.remove_custom_field(
-                        document_id, CF_PAGINIERUNG,
-                    )
-                    logger.debug(
-                        "Paginierung entfernt (digitales Dokument): Dokument %d",
-                        document_id,
-                    )
+        await self._paperless.update_document(document_id, **patch)
 
     async def _set_error_status(self, document_id: int) -> None:
         """Setzt ki_status = "error" und entfernt Tag "NEU" bei Verarbeitungsfehlern.

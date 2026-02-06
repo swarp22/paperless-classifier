@@ -415,7 +415,12 @@ def _resolve_custom_fields(
         ))
 
     # Haus-Register (Select-Feld)
-    if result.is_house_folder_candidate and result.house_register:
+    # Nur für gescannte Dokumente relevant – digitale PDFs werden nicht
+    # physisch im Haus-Ordner abgelegt (Design-Dok 13.6.1).
+    if (result.is_house_folder_candidate
+            and result.house_register
+            and result.is_scanned_document
+            and result.pagination_stamp is None):
         option_id = cache.get_select_option_id(CF_HAUS_REGISTER, result.house_register)
         if option_id:
             custom_fields.append(CustomFieldResolution(
@@ -435,5 +440,10 @@ def _resolve_custom_fields(
                 original_label=result.house_register,
                 resolved=False,
             ))
+    elif result.is_house_folder_candidate and not result.is_scanned_document:
+        logger.debug(
+            "Haus-Register übersprungen: digitales Dokument "
+            "(is_house_folder_candidate ignoriert)",
+        )
 
     return custom_fields

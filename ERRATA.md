@@ -139,16 +139,87 @@ Anthropic hat zwei Cache-Write-Stufen eingeführt:
 
 ---
 
-## E-008: Error-Handling – Tag "NEU" wird bei Fehler entfernt (AP-05, 2026-02-06)
+## E-009: Race Condition bei Multi-PATCH – NEU-Tag wird nicht entfernt (AP-05, 2026-02-06)
 
-**Betrifft:** `app/classifier/pipeline.py` (`_set_error_status`), Design-Dokument Abschnitt 13.8
+**Betrifft:** `app/classifier/pipeline.py`, Methode `_apply_result()`
 
-**Vorher (Design + AP-04):** Bei Verarbeitungsfehlern blieb Tag "NEU" erhalten (`ki_status=error`), damit automatischer Retry möglich war.
+**Problem:** Im ersten Live-Test wurden 2 von 10 Dokumenten doppelt verarbeitet. Der NEU-Tag wurde trotz erfolgreicher Klassifizierung nicht entfernt. Beim nächsten Polling-Zyklus erkannte der Poller diese Dokumente erneut als "neu" und verarbeitete sie ein zweites Mal (zusätzliche API-Kosten, Titel-Überschreibung).
 
-**Problem:** Der Poller erkennt Dokumente ausschließlich über Tag "NEU" (kein ki_status-Filter). Ein errored Dokument mit NEU-Tag würde bei jedem Polling-Zyklus erneut verarbeitet → Endlosschleife mit API-Kosten.
+**Ursache:** `_apply_result()` führte 2–4 separate PATCH-Aufrufe gegen die Paperless-API aus:
 
-**Entscheidung:** Tag "NEU" ist der einzige Trigger. `ki_status` ist reine Statusinformation für den Nutzer. Bei Error wird NEU entfernt und `ki_status=error` gesetzt. Retry durch manuelles Hinzufügen des NEU-Tags.
+1. PATCH: Titel, Korrespondent, Typ, Pfad, Tags (NEU entfernt)
+2. PATCH: Custom Field `ki_status` setzen
+3. PATCH: Custom Field `Person` setzen (falls aufgelöst)
+4. PATCH: Custom Field `Paginierung` entfernen (falls digital)
 
-**Geändert in:** `_set_error_status()` entfernt jetzt Tag "NEU" (ID 12) zusätzlich zu `ki_status=error`. Die zwei Operationen (ki_status setzen, Tag entfernen) sind separat in try/except gefasst, damit ein Teilfehler nicht die andere Operation verhindert.
+Jeder `set_custom_field`-Aufruf lud das Dokument frisch und sendete einen separaten PATCH mit nur `custom_fields`. Race Condition: Wenn PATCH 2+ vor dem vollständigen Commit von PATCH 1 ausgeführt wurde, konnte Paperless-ngx den alten Tag-Zustand (mit NEU) zurückschreiben.
 
-**Auswirkung:** Kein automatischer Retry mehr. Fehlerhafte Dokumente sind über einen Paperless-Filter `ki_status=error` auffindbar. Der Safety-Check (`ki_status=null` ohne Tag-Filter) aus dem Design-Dokument ist für Phase 1 nicht implementiert, weil er beim ersten Lauf alle Bestandsdokumente finden würde. Kann in einem späteren AP mit SQLite-State nachgerüstet werden.
+**Lösung:** Alle Änderungen (Metadaten + Tags + Custom Fields) in einem einzigen PATCH zusammengefasst. Custom Fields werden nicht mehr über die `set_custom_field()`-Hilfsmethode gesetzt, sondern direkt im Payload:
+
+```python
+# Vorher: 2-4 separate PATCH-Aufrufe
+await self._paperless.update_document(doc_id, title=..., tags=..., ...)
+await self._paperless.set_custom_field_by_label(doc_id, CF_KI_STATUS, ...)
+await self._paperless.set_custom_field(doc_id, cf.field_id, cf.value)
+
+# Nachher: 1 einziger PATCH-Aufruf
+patch["tags"] = sorted(current_tags)
+patch["custom_fields"] = [{"field": fid, "value": val} for fid, val in cf_map.items()]
+await self._paperless.update_document(doc_id, **patch)
+```
+
+**Nicht-deterministisch:** Nur 2 von 10 Dokumenten betroffen – typisch für Race Conditions. Hängt von Paperless-DB-Last und Timing ab.
+
+---
+
+## E-010: Rate-Limit-Handling – Dokument nicht als Error markieren (AP-05, 2026-02-06)
+
+**Betrifft:** `app/classifier/pipeline.py`, `app/scheduler/poller.py`
+
+**Problem:** Bei einem HTTP 429 (Rate Limit) von der Claude API wurde das betroffene Dokument als `ki_status=error` markiert und der NEU-Tag entfernt. Der Poller machte dann mit dem nächsten Dokument weiter – das ebenfalls ein Rate-Limit bekam. Ergebnis: Alle verbleibenden Dokumente im Zyklus wurden fälschlich als Error markiert. User musste bei jedem manuell den NEU-Tag wieder setzen.
+
+**Ursache:** Die Pipeline fing alle `ClaudeError`-Exceptions gleich und rief `_set_error_status()` auf – egal ob permanenter Fehler (ungültige Antwort) oder temporärer Fehler (Rate-Limit). Der Poller hatte keine Möglichkeit, zwischen beiden zu unterscheiden.
+
+**Lösung (zwei Teile):**
+
+1. **Pipeline** (pipeline.py): Bei HTTP 429/529 wird die Exception **nicht** gefangen, sondern an den Poller weitergeworfen. `_set_error_status()` wird NICHT aufgerufen – NEU-Tag bleibt, ki_status bleibt null.
+
+2. **Poller** (poller.py):
+   - Fängt `ClaudeAPIError` mit `status_code in (429, 529)` explizit
+   - Bricht den gesamten Zyklus ab (nicht nur das eine Dokument)
+   - Verbleibende Dokumente werden beim nächsten Zyklus automatisch verarbeitet
+   - `DOCUMENT_DELAY_SECONDS = 2.0` – Pause zwischen Dokumenten verhindert Bursts
+
+**Unterschied zum bisherigen Verhalten:**
+
+| Szenario | Vorher | Nachher |
+|---|---|---|
+| HTTP 429 bei Dokument X | ki_status=error, NEU entfernt, nächstes Dok. | Zyklus abgebrochen, Dok. unverändert |
+| Nächster Polling-Zyklus | Dok. X wird ignoriert | Dok. X wird erneut versucht |
+| User-Eingriff nötig? | Ja (NEU-Tag manuell setzen) | Nein |
+
+---
+
+## E-011: Haus-Register wird bei digitalen Dokumenten fälschlich gesetzt (AP-05, 2026-02-06)
+
+**Betrifft:** `app/classifier/resolver.py`, `app/classifier/pipeline.py`
+
+**Problem:** Claude setzt `is_house_folder_candidate: true` und `house_register` bei digitalen PDFs mit Speicherpfad "Haus Bietigheim / ...". Der Resolver prüfte nur `is_house_folder_candidate and house_register`, nicht aber `is_scanned_document`. Ergebnis: Alle Strom-, Gas-, Darlehensdokumente bekamen ein Haus-Register zugewiesen, obwohl sie nie physisch abgelegt werden.
+
+**Design-Vorgabe (Abschnitt 13.6.1):** "Digital-native → Haus-Felder: ENTFERNEN". Haus-Ordner-Kandidat nur bei: gescanntes Dokument + kein Paginierstempel + Pfad beginnt mit "Haus Bietigheim".
+
+**Lösung (zwei Teile):**
+
+1. **Resolver** (resolver.py): Guard erweitert – Haus-Register wird nur aufgelöst wenn `is_scanned_document=true` UND `pagination_stamp=null`. Bei digitalen Dokumenten wird `is_house_folder_candidate` ignoriert.
+
+2. **Pipeline** (`_apply_result`): Bestehende Haus-Felder (Register + Ordnungszahl) werden bei digitalen Dokumenten aus der `cf_map` entfernt – gleiche Logik wie für Paginierung.
+
+---
+
+## E-012: Steuer-Tag wird nicht automatisch angelegt (Eselsohr für Phase 3)
+
+**Betrifft:** `app/classifier/resolver.py`, Zeile 333-338
+
+**Problem:** Die Steuer-Tag-Ableitung (`"Steuer {year}"` aus `tax_relevant + tax_year`) sucht den Tag im Cache. Wenn er nicht existiert (z.B. "Steuer 2026" ab Januar 2026), wird nur geloggt – der Tag wird **nicht** in `create_new_tags` aufgenommen. Selbst mit `auto_create_tags=True` würde er daher nicht angelegt.
+
+**Kein Fix nötig jetzt:** Auto-Create ist in Phase 3 vorgesehen ("Neuanlage von Tags/Korrespondenten/Typen/Pfaden" + Confidence-basierte Steuerung). Wenn das aktiviert wird, muss der Resolver den fehlenden Steuer-Tag in `resolved.create_new_tags` aufnehmen, damit `_handle_create_new()` ihn anlegen kann.
