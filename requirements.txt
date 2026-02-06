@@ -1,0 +1,27 @@
+# Paperless Claude Classifier – Python Dependencies
+# Zielplattform: ARM64 (Raspberry Pi 4)
+
+# === Web-UI + API Server ===
+# NiceGUI bringt FastAPI + Uvicorn mit
+nicegui>=2.9.0,<3.0
+
+# === Konfiguration ===
+pydantic-settings>=2.7.0,<3.0
+
+# === HTTP Client (Paperless API, Health-Checks) ===
+httpx>=0.28.0,<1.0
+
+# === Retry-Logik für API-Clients ===
+tenacity>=9.0.0,<10.0
+
+# === Claude API ===
+anthropic>=0.45.0,<1.0
+
+# === PDF-Verarbeitung (für Model-Routing, Seitenanzahl etc.) ===
+PyMuPDF>=1.25.0,<2.0
+
+# === Datenbank ===
+aiosqlite>=0.21.0,<1.0
+
+# === Logging ===
+# Python stdlib logging reicht aus – keine externe Dependency nötig

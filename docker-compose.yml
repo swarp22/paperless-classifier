@@ -1,0 +1,30 @@
+# Paperless Claude Classifier – Docker Compose
+# Pfad auf dem Pi: /DATA/AppData/paperless-classifier (siehe ERRATA E-004)
+
+services:
+  paperless-classifier:
+    build: .
+    container_name: paperless-classifier
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    environment:
+      # Defaults – werden von .env überschrieben falls gesetzt
+      - DEFAULT_MODEL=claude-sonnet-4-5-20250929
+      - BATCH_MODEL=claude-sonnet-4-5-20250929
+      - SCHEMA_MATRIX_MODEL=claude-opus-4-5-20251101
+      - SCHEMA_MATRIX_SCHEDULE=weekly
+      - SCHEMA_MATRIX_THRESHOLD=20
+      - SCHEMA_MATRIX_MIN_INTERVAL_H=24
+      - POLLING_INTERVAL_SECONDS=300
+      - PROCESSING_MODE=immediate
+      - MONTHLY_COST_LIMIT_USD=25.0
+      - LOG_LEVEL=INFO
+    volumes:
+      - classifier_data:/app/data
+
+volumes:
+  classifier_data:
+    driver: local

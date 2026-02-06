@@ -1,0 +1,36 @@
+# === Secrets & Konfiguration ===
+.env
+.env.local
+.env.production
+*.key
+*.pem
+
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# === Datenbank & Laufzeitdaten ===
+data/
+*.db
+*.sqlite3
+
+# === Logs ===
+logs/
+*.log
+
+# === Betriebssystem ===
+.DS_Store
+Thumbs.db
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
