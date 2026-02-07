@@ -682,6 +682,93 @@ class Database:
         row = await cursor.fetchone()
         return int(row[0]) if row else 0
 
+    # --- Review Queue (AP-08) ---
+
+    async def get_review_count(self) -> int:
+        """Anzahl der Dokumente mit status='review' in der DB.
+
+        Wird für das Sidebar-Badge verwendet.
+
+        Returns:
+            Anzahl offener Reviews.
+        """
+        conn = self.connection
+        cursor = await conn.execute(
+            """
+            SELECT COUNT(*) FROM processed_documents
+            WHERE status = 'review'
+            """,
+        )
+        row = await cursor.fetchone()
+        return int(row[0]) if row else 0
+
+    async def get_review_documents(self) -> list[dict[str, Any]]:
+        """Alle Dokumente mit status='review', neueste zuerst.
+
+        Liefert den jeweils letzten Verarbeitungsversuch pro paperless_id,
+        da ein Dokument mehrfach verarbeitet worden sein kann (Retry).
+
+        Returns:
+            Liste von Datensätzen mit classification_json, confidence,
+            reasoning, model_used, cost_usd, paperless_id etc.
+        """
+        conn = self.connection
+        # Nur den letzten Verarbeitungsversuch pro Dokument nehmen
+        # (höchste id = neuester Versuch)
+        cursor = await conn.execute(
+            """
+            SELECT pd.* FROM processed_documents pd
+            INNER JOIN (
+                SELECT paperless_id, MAX(id) AS max_id
+                FROM processed_documents
+                WHERE status = 'review'
+                GROUP BY paperless_id
+            ) latest ON pd.id = latest.max_id
+            ORDER BY pd.processed_at DESC
+            """,
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def update_review_status(
+        self,
+        record_id: int,
+        new_status: str,
+        reviewed_by: str = "user",
+    ) -> None:
+        """Setzt den Review-Status eines processed_document-Eintrags.
+
+        Args:
+            record_id: Primärschlüssel (id) in processed_documents.
+            new_status: Neuer Status ('classified' oder 'manual').
+            reviewed_by: Wer die Review durchgeführt hat.
+
+        Raises:
+            ValueError: Wenn new_status ungültig ist.
+        """
+        if new_status not in ("classified", "manual"):
+            raise ValueError(
+                f"Ungültiger Review-Status: '{new_status}' "
+                "(erlaubt: 'classified', 'manual')"
+            )
+
+        conn = self.connection
+        await conn.execute(
+            """
+            UPDATE processed_documents
+            SET status = ?,
+                reviewed_by = ?,
+                reviewed_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (new_status, reviewed_by, record_id),
+        )
+        await conn.commit()
+        logger.debug(
+            "Review-Status aktualisiert: record_id=%d → %s (by %s)",
+            record_id, new_status, reviewed_by,
+        )
+
     async def get_avg_cost_per_document(
         self,
         year: int | None = None,

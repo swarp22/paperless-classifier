@@ -14,9 +14,10 @@ def register_pages() -> None:
     Muss aufgerufen werden BEVOR `ui.run()` startet, damit die
     Routen beim Server-Start bekannt sind.
     """
-    from app.ui import costs, dashboard, logs, settings
+    from app.ui import costs, dashboard, logs, review, settings
 
     dashboard.register()
+    review.register()
     costs.register()
     settings.register()
     logs.register()

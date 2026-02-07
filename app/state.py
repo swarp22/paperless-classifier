@@ -35,6 +35,11 @@ def get_database() -> Any:
     return database
 
 
+def get_paperless_client() -> Any:
+    """Gibt die PaperlessClient-Instanz zurück."""
+    return paperless_client
+
+
 def get_poller() -> Any:
     """Gibt die Poller-Instanz zurück."""
     return poller

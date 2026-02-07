@@ -124,11 +124,31 @@ def evaluate_confidence(resolved: ResolvedClassification) -> ConfidenceEvaluatio
     reasons.append(f"Claude-Confidence: {claude_level.value} ({claude_score:.1f})")
 
     # --- Signal 2: Mapping-Erfolgsquote ---
-    mapping_score = resolved.resolution_ratio
+    # E-018: Null-Felder einbeziehen. Wenn Claude für Hauptfelder null
+    # zurückgibt, ist das ein Zeichen von Unsicherheit. Wir berechnen
+    # die Mapping-Ratio über ALLE 3 Hauptfelder, nicht nur über die
+    # von Claude benannten.
+    #
+    # Beispiel: Claude sagt correspondent=null, document_type="Rechnung" (aufgelöst)
+    # → Alte Logik: 1/1 = 100% (null ist unsichtbar)
+    # → Neue Logik: 1/3 aufgelöst + 2 null = effektiver Score niedriger
+    CORE_FIELD_COUNT = 3  # Korrespondent, Dokumenttyp, Speicherpfad
+    null_fields = resolved.null_field_count
+    named_total = resolved.total_fields       # Felder die Claude benannt hat
+    named_resolved = resolved.resolved_fields  # davon erfolgreich aufgelöst
+
+    if null_fields == 0 and named_total == 0:
+        # Sonderfall: Weder benannt noch null → z.B. nur Tags
+        mapping_score = resolved.resolution_ratio
+    else:
+        # Effektive Quote: aufgelöste Felder / (benannte + null-Felder)
+        effective_total = named_total + null_fields
+        mapping_score = named_resolved / effective_total if effective_total > 0 else 0.0
+
     if mapping_score < 1.0:
         reasons.append(
-            f"Mapping: {resolved.resolved_fields}/{resolved.total_fields} "
-            f"aufgelöst ({mapping_score:.0%})"
+            f"Mapping: {named_resolved}/{named_total} Felder aufgelöst, "
+            f"{null_fields} Null-Felder ({mapping_score:.0%} effektiv)"
         )
         if resolved.unresolved_names:
             reasons.append(
@@ -171,7 +191,9 @@ def evaluate_confidence(resolved: ResolvedClassification) -> ConfidenceEvaluatio
     )
 
     # --- Level und Aktion ableiten ---
-    if total_score >= THRESHOLD_HIGH:
+    # E-018: Strikte Schwelle für HIGH (>) statt (>=), damit Grenzfälle
+    # wie "2/3 Null-Felder bei Claude-HIGH" in die Review Queue gehen.
+    if total_score > THRESHOLD_HIGH:
         level = ConfidenceLevel.HIGH
         action = ApplyAction.AUTO_APPLY
     elif total_score >= THRESHOLD_MEDIUM:
@@ -180,6 +202,18 @@ def evaluate_confidence(resolved: ResolvedClassification) -> ConfidenceEvaluatio
     else:
         level = ConfidenceLevel.LOW
         action = ApplyAction.REVIEW_ONLY
+
+    # E-018b: Wenn Claude Kern-Felder nicht bestimmen konnte (null),
+    # ist die Klassifizierung unvollständig.  Unvollständig = nie HIGH.
+    # Prinzip: Ein fehlender Korrespondent oder Speicherpfad bedeutet,
+    # dass ein Mensch drüberschauen sollte.
+    if null_fields > 0 and level == ConfidenceLevel.HIGH:
+        level = ConfidenceLevel.MEDIUM
+        action = ApplyAction.APPLY_FOR_REVIEW
+        reasons.append(
+            f"{null_fields} Kern-Feld(er) nicht bestimmt "
+            f"→ Confidence von HIGH auf MEDIUM herabgestuft"
+        )
 
     reasons.insert(0, f"Gesamtscore: {total_score:.2f} → {level.value} → {action.value}")
 

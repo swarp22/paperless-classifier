@@ -97,6 +97,12 @@ class ResolvedClassification:
     # Nicht aufgelöste Namen (für Neuanlage-Prüfung)
     unresolved_names: list[str] = field(default_factory=list)
 
+    # E-018: Zählt Hauptfelder, für die Claude null zurückgab.
+    # "Korrespondent nicht bestimmbar" ist ein anderes Signal als
+    # "Korrespondent genannt aber nicht im Cache gefunden" – beides
+    # muss die Confidence senken, aber aus unterschiedlichen Gründen.
+    null_field_count: int = 0
+
     # Neuanlage-Vorschläge (direkt von Claude)
     create_new_correspondents: list[str] = field(default_factory=list)
     create_new_tags: list[str] = field(default_factory=list)
@@ -271,6 +277,9 @@ def resolve_classification(
         resolved.correspondent_id = resolution.resolved_id
         if resolution.match_type == "not_found":
             resolved.unresolved_names.append(f"Korrespondent: {result.correspondent}")
+    else:
+        # E-018: Claude konnte keinen Korrespondenten bestimmen
+        resolved.null_field_count += 1
 
     # --- Dokumenttyp ---
     if result.document_type:
@@ -285,6 +294,9 @@ def resolve_classification(
         resolved.document_type_id = resolution.resolved_id
         if resolution.match_type == "not_found":
             resolved.unresolved_names.append(f"Dokumenttyp: {result.document_type}")
+    else:
+        # E-018: Claude konnte keinen Dokumenttyp bestimmen
+        resolved.null_field_count += 1
 
     # --- Speicherpfad ---
     if result.storage_path:
@@ -299,6 +311,9 @@ def resolve_classification(
         resolved.storage_path_id = resolution.resolved_id
         if resolution.match_type == "not_found":
             resolved.unresolved_names.append(f"Speicherpfad: {result.storage_path}")
+    else:
+        # E-018: Claude konnte keinen Speicherpfad bestimmen
+        resolved.null_field_count += 1
 
     # --- Tags ---
     tag_map = {
@@ -311,6 +326,15 @@ def resolve_classification(
         resolution = _fuzzy_match(tag_name, tag_map)
         resolved.tag_resolutions.append(resolution)
         if resolution.resolved_id is not None:
+            # Trigger-Tag "NEU" niemals in die aufgelösten Tags aufnehmen.
+            # Claude sieht "NEU" im System-Prompt und gibt ihn manchmal
+            # als Tag zurück – er ist aber kein semantischer Tag, sondern
+            # ein Workflow-Trigger.
+            if resolution.resolved_id == TAG_NEU_ID:
+                logger.debug(
+                    "Tag 'NEU' aus Claude-Antwort ignoriert (Trigger-Tag)"
+                )
+                continue
             resolved.tag_ids.append(resolution.resolved_id)
         else:
             resolved.unresolved_names.append(f"Tag: {tag_name}")
@@ -352,7 +376,7 @@ def resolve_classification(
 
     logger.info(
         "Auflösung abgeschlossen: %d/%d Felder aufgelöst (%.0f%%), "
-        "%d nicht aufgelöst, %d Fuzzy-Matches",
+        "%d nicht aufgelöst, %d Fuzzy-Matches, %d Null-Felder",
         resolved.resolved_fields,
         resolved.total_fields,
         resolved.resolution_ratio * 100,
@@ -365,6 +389,7 @@ def resolve_classification(
             ] + resolved.tag_resolutions
             if r is not None and r.match_type == "fuzzy"
         ),
+        resolved.null_field_count,
     )
 
     return resolved

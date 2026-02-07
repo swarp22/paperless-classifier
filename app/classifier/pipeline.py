@@ -197,8 +197,16 @@ class ClassificationPipeline:
             result.pdf_analysis = pdf_analysis
 
             # Korrespondent bereits bekannt? (für Model Router)
+            # E-020: Nur als "bekannt" werten, wenn UNSER Classifier das
+            # Dokument bereits verarbeitet hat (ki_status gesetzt).
+            # Paperless' eigener Auto-Matcher setzt oft falsche Korrespondenten
+            # auf NEU-Dokumente – diese dürfen die Modellwahl nicht beeinflussen.
             doc = await self._paperless.get_document(document_id)
-            correspondent_known = doc.correspondent is not None
+            ki_status_value = doc.get_custom_field_value(CF_KI_STATUS)
+            correspondent_known = (
+                doc.correspondent is not None
+                and ki_status_value is not None
+            )
 
             # Paginierstempel erwartet? (Heuristik: gescanntes Dokument)
             expects_stamp = pdf_analysis.is_image_pdf
@@ -324,10 +332,12 @@ class ClassificationPipeline:
             await self._paperless.load_cache()
 
         # PromptData aus Cache befüllen
+        # E-026: "NEU" ist ein Workflow-Trigger, kein semantischer Tag.
+        # Claude soll ihn weder sehen noch vorschlagen.
         data = PromptData(
             correspondents=cache.get_all_correspondent_names(),
             document_types=cache.get_all_document_type_names(),
-            tags=cache.get_all_tag_names(),
+            tags=[t for t in cache.get_all_tag_names() if t != "NEU"],
             storage_paths=cache.get_all_storage_path_names(),
             person_options=cache.get_select_option_labels(CF_PERSON),
             house_register_options=cache.get_select_option_labels(CF_HAUS_REGISTER),
@@ -453,9 +463,11 @@ class ClassificationPipeline:
                 sp_name = sp_data["name"]
                 if self._paperless.cache.get_storage_path_id(sp_name) is not None:
                     continue
-                sp_path = sp_data.get(
-                    "path_template",
-                    self._config.storage_path_template,
+                # Template aus dem Namen ableiten:
+                # "Topic / Objekt / Entität" → "/Topic/Objekt/Entität/{{…}}"
+                sp_path = (
+                    "/" + sp_name.replace(" / ", "/")
+                    + "/{{created_year}}/{{title}}_{{created}}"
                 )
                 try:
                     created = await self._paperless.create_storage_path(
@@ -527,24 +539,26 @@ class ClassificationPipeline:
             if resolved.title:
                 patch["title"] = resolved.title
 
-            # Korrespondent
-            if resolved.correspondent_id is not None:
-                patch["correspondent"] = resolved.correspondent_id
-
-            # Dokumenttyp
-            if resolved.document_type_id is not None:
-                patch["document_type"] = resolved.document_type_id
-
-            # Speicherpfad
-            if resolved.storage_path_id is not None:
-                patch["storage_path"] = resolved.storage_path_id
+            # E-019: Korrespondent, Dokumenttyp, Speicherpfad IMMER setzen.
+            # Wenn Claude null zurückgibt, muss das als explizites "unbekannt"
+            # an Paperless gehen, um falsche Zuordnungen des Paperless-eigenen
+            # Auto-Matchers zu überschreiben.  Vorher wurden null-Werte
+            # stillschweigend übersprungen → Paperless-Matcher blieb stehen.
+            patch["correspondent"] = resolved.correspondent_id  # int | None
+            patch["document_type"] = resolved.document_type_id  # int | None
+            patch["storage_path"] = resolved.storage_path_id    # int | None
 
             # Datum
             if resolved.date:
                 patch["created_date"] = resolved.date
 
-            # Neue Tags hinzufügen
-            current_tags.update(resolved.tag_ids)
+            # Neue Tags hinzufügen – aber niemals den Trigger-Tag "NEU"
+            # zurückschreiben.  Claude sieht "NEU" im System-Prompt als
+            # verfügbaren Tag und gibt ihn manchmal in seiner Antwort zurück.
+            # Ohne diesen Filter wird der gerade entfernte NEU-Tag sofort
+            # wieder hinzugefügt → Endlos-Verarbeitungsschleife.
+            new_tags = [t for t in resolved.tag_ids if t != TAG_NEU_ID]
+            current_tags.update(new_tags)
 
             # Aufgelöste Custom Fields setzen (z.B. Person)
             for cf in resolved.custom_fields:
@@ -677,7 +691,14 @@ class ClassificationPipeline:
                 model_used=result.model_used,
                 processing_mode="immediate",
                 classification_json=classification_json,
-                confidence=raw_result.confidence.value if raw_result else "",
+                # E-022: Evaluierte System-Confidence speichern, nicht
+                # Claudes Selbsteinschätzung.  Claude sagt oft "high",
+                # aber das System stuft bei Null-Feldern auf "medium" herab.
+                confidence=(
+                    result.confidence.level.value
+                    if result.confidence
+                    else (raw_result.confidence.value if raw_result else "")
+                ),
                 reasoning=raw_result.reasoning if raw_result else None,
                 status=status,
                 error_message=result.error,
