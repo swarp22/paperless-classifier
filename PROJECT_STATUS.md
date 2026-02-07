@@ -3,7 +3,7 @@
 Dieses Dokument dient als Chat-übergreifender Kontext für die Entwicklung
 mit Claude. Es wird nach jedem abgeschlossenen Arbeitspaket aktualisiert.
 
-**Letzte Aktualisierung:** 2026-02-07, nach AP-06
+**Letzte Aktualisierung:** 2026-02-07, nach AP-09
 
 ---
 
@@ -93,14 +93,54 @@ mit Claude. Es wird nach jedem abgeschlossenen Arbeitspaket aktualisiert.
 - **ERRATA E-014:** CostTracker-Methoden async (Breaking Change, alle Aufrufer angepasst)
 - **ERRATA E-015:** Schema-Abweichungen (paperless_id nicht UNIQUE, duration_seconds + error_message ergänzt, Cache-Token in daily_costs)
 
+### AP-07: Web-UI Basis ✓
+- NiceGUI-Grundgerüst mit Sidebar-Navigation und Header
+- `app/ui/layout.py`: Wiederverwendbares Layout (Sidebar + Content)
+- `app/ui/dashboard.py`: Poller-Status, Zähler-Karten (Heute/Woche/Monat), Dokumenten-Tabelle
+- `app/ui/costs.py`: Kosten-Übersicht mit ECharts-Tagesdiagramm, Modell-Badges
+- `app/ui/settings.py`: Verbindungsstatus-Prüfung, Config-Anzeige, Poller-Steuerung
+- `app/ui/logs.py`: Log-Viewer mit Level-Filter, Traceback-Gruppierung
+- `app/state.py`: Getter-Funktionen ausgelagert (E-017: verhindert doppelte Startup-Registrierung)
+- **ERRATA:** E-016 bis E-022
+
+### AP-08: Review-Queue ✓
+- `app/ui/review.py`: Vollständige Review-Queue mit Approve/Reject/Edit
+- Vorschau aller Claude-Zuordnungen (Korrespondent, Typ, Tags, Pfad, Custom Fields, Titel)
+- Direkte Neuanlage von Korrespondenten/Dokumenttypen/Tags aus der Review-Queue
+- Freitext-Bearbeitung aller Felder vor der Anwendung
+- Badge-Zähler im Sidebar-Menü, Poller-Status-Chip im Header
+- **ERRATA:** E-023 bis E-029
+
+### AP-09: Kosten-Dashboard & UI-Polish ✓
+- Kosten-Seite: Woche-Karte, Modell-Kosten mit Prozentanteil, Ø Tokens/Dokument, Cache-Ersparnis
+- DB-Migration: daily_costs um sonnet_cost_usd/haiku_cost_usd (ALTER TABLE, idempotent)
+- Neue DB-Methoden: get_avg_tokens_per_document(), get_cache_savings()
+- Auto-Refresh: Dashboard (30s), Kosten (30s), Log-Viewer (5s Toggle)
+- Dashboard: Paperless-ID als klickbarer Link zur Dokumentdetailseite
+- Log-Viewer: Textsuche, Component-Filter, Auto-Refresh-Switch
+- Settings: Header-Chip synchronisiert sich nach Poller-Steuerung (Delayed Reload)
+- **ERRATA:** E-030 bis E-032
+
 ## Nächstes Arbeitspaket
 
-**AP-07: Web-UI Basis (Phase 2)**
-- NiceGUI-Grundgerüst mit Navigation (Sidebar/Header)
-- Dashboard: Poller-Status, letzte Verarbeitungen aus SQLite, Tageskosten
-- Kosten-Übersicht: Monat/Tag, Modell-Aufschlüsselung, Limit-Anzeige
-- Einstellungsseite: Verbindungsstatus, aktuelle Config (read-only zunächst)
-- Design-Dokument: Abschnitt 7 (Web-UI Design)
+**AP-10: Schema-Analyse – Collector & Datenmodell (Phase 3)**
+- SQLite-Tabellen: schema_title_patterns, schema_path_rules, schema_mapping_matrix, schema_analysis_runs
+- Collector: Titel/Typ/Korrespondent/Pfad aus Paperless sammeln und vorverarbeiten
+- Gruppierung: Titel nach (Dokumenttyp, Korrespondent), Pfad-Hierarchie extrahieren
+- Trigger-Logik: Wöchentlich + Schwellwert (≥20 neue Docs) + manuell
+- Design-Dokument: Abschnitt 8 (Schema-Analyse) + Abschnitt 6 (Datenmodell)
+
+**AP-11: Schema-Analyse – Opus-Analyse & Prompt-Builder**
+- Opus-API-Aufruf: Analyse-Prompt mit vorverarbeiteten Collector-Daten
+- Response-Parsing: JSON → SQLite (Titel-Schemata, Pfad-Regeln, Matrix)
+- Prompt-Builder: Schema-Regeln in den Klassifizierungs-System-Prompt einbetten
+- Upsert-Logik: Manuelle Einträge (is_manual=TRUE) nicht überschreiben
+
+**AP-12: Schema-Analyse – Web-UI**
+- Drei Tabs: Titel-Schemata, Pfad-Regeln, Zuordnungsmatrix
+- Bearbeiten/Fixieren einzelner Einträge (is_manual setzen)
+- Manueller Trigger-Button für Schema-Analyse-Lauf
+- Anzeige des letzten Lauf-Ergebnisses (Audit-Log)
 
 ## Konfiguration (config.py – aktuelle Werte)
 
@@ -126,14 +166,16 @@ paperless-classifier/
 │   ├── main.py                    # NiceGUI Einstiegspunkt
 │   ├── config.py                  # Pydantic Settings
 │   ├── logging_config.py          # Logging-Konfiguration
+│   ├── state.py                   # Globale Laufzeit-Objekte + Getter (AP-07)
+│   ├── health.py                  # Health-Check-Logik
 │   ├── claude/                    # AP-03
 │   │   ├── __init__.py
 │   │   ├── client.py
 │   │   ├── cost_tracker.py
 │   │   └── prompts.py
-│   ├── db/                        # AP-06
+│   ├── db/                        # AP-06 + AP-09
 │   │   ├── __init__.py
-│   │   └── database.py           # SQLite State-Management
+│   │   └── database.py           # SQLite (daily_costs mit per-Modell-Kosten)
 │   ├── classifier/                # AP-04 + Fixes aus AP-05
 │   │   ├── __init__.py
 │   │   ├── model_router.py        # PDF-Analyse + Modellwahl
@@ -146,15 +188,23 @@ paperless-classifier/
 │   │   ├── client.py
 │   │   ├── exceptions.py
 │   │   └── models.py
-│   └── scheduler/                 # AP-05
-│       ├── __init__.py
-│       └── poller.py
+│   ├── scheduler/                 # AP-05
+│   │   ├── __init__.py
+│   │   └── poller.py
+│   └── ui/                        # AP-07 + AP-08 + AP-09
+│       ├── __init__.py            # register_pages()
+│       ├── layout.py              # Sidebar + Header Layout
+│       ├── dashboard.py           # Startseite (Auto-Refresh 30s)
+│       ├── costs.py               # Kosten-Dashboard (Auto-Refresh 30s)
+│       ├── review.py              # Review-Queue mit Approve/Reject/Edit
+│       ├── settings.py            # Config-Anzeige + Poller-Steuerung
+│       └── logs.py                # Log-Viewer (Suche, Filter, Auto-Refresh)
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
 ├── .env.example
 ├── .gitignore
-├── ERRATA.md                      # Abweichungen zur Design-Doku (E-001 bis E-015)
+├── ERRATA.md                      # Abweichungen zur Design-Doku (E-001 bis E-032)
 ├── PROJECT_STATUS.md              # ← Dieses Dokument
 └── README.md
 ```

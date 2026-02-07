@@ -520,3 +520,33 @@ Betroffene Funktionen:
 **Problem:** Poller-Status "Aktiv" mit grünem Punkt war kaum sichtbar ganz rechts oben im Browser-Chrome. Review-Badge mit `floating`-Prop wurde absolut positioniert und erschien außerhalb des Sidebar-Containers.
 
 **Lösung:** Poller-Status als halbtransparenter Chip (`bg-white/10 border-white/20`) im Header. Review-Badge ohne `floating`, stattdessen `ml-auto` für Inline-Positionierung in der Sidebar-Zeile.
+
+---
+
+## E-030: daily_costs um per-Modell-Kosten erweitert (AP-09, 2026-02-07)
+
+**Betrifft:** `app/db/database.py`, Design-Dokument Abschnitt 6 (Datenmodell)
+
+**Problem:** Das Design-Dokument sieht in `daily_costs` nur `opus_cost_usd` als separate Kostenspalte vor. Sonnet- und Haiku-Kosten waren nicht getrennt trackbar – `get_model_breakdown()` konnte nur Stückzahlen liefern, keine Beträge.
+
+**Lösung:** Zwei neue Spalten `sonnet_cost_usd REAL DEFAULT 0.0` und `haiku_cost_usd REAL DEFAULT 0.0` in `daily_costs`. Schema-Migration per `ALTER TABLE` mit PRAGMA-Prüfung (idempotent). UPSERT in `insert_processed_document()` befüllt die neuen Spalten. `get_model_breakdown()` liefert jetzt echte Kosten + Prozentanteil pro Modell.
+
+---
+
+## E-031: Historische per-Modell-Kosten nicht rückwirkend befüllt (AP-09, 2026-02-07)
+
+**Betrifft:** `daily_costs`-Tabelle, Kosten-Dashboard
+
+**Problem:** Bestehende `daily_costs`-Einträge (vor AP-09) haben `sonnet_cost_usd=0.0` und `haiku_cost_usd=0.0`. Die Modell-Aufschlüsselung zeigt für Alt-Daten "$0.00" bei Sonnet/Haiku, obwohl tatsächlich Kosten angefallen sind.
+
+**Workaround:** Korrekte Werte werden ab dem ersten Dokument nach dem Update getrackt. Ein Backfill-Script könnte die Kosten nachträglich aus `processed_documents` aggregieren, ist aber nicht im Scope von AP-09.
+
+---
+
+## E-032: Log-Viewer Clearable-Input sendet None (AP-09, 2026-02-07)
+
+**Betrifft:** `app/ui/logs.py`
+
+**Problem:** NiceGUI `ui.input` mit `.props("clearable")` sendet `e.value = None` (nicht `""`) beim Klick auf das X-Symbol. `_filter_entries()` rief `.lower()` auf `None` auf → `AttributeError`.
+
+**Lösung:** Handler abgesichert mit `e.value or ""`, Filter-Funktion mit `(current_search["value"] or "").lower().strip()`.
