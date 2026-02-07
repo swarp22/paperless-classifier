@@ -10,6 +10,7 @@ Design-Referenz: Abschnitt 7.3 (Einstellungen)
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from nicegui import ui
@@ -18,6 +19,16 @@ from app.logging_config import get_logger
 from app.ui.layout import page_layout
 
 logger = get_logger("app")
+
+
+async def _delayed_reload() -> None:
+    """Lädt die Seite nach kurzer Verzögerung neu.
+
+    Damit die Notify-Meldung noch sichtbar ist, bevor die Seite
+    neu lädt und der Header-Chip den aktuellen Poller-Status zeigt.
+    """
+    await asyncio.sleep(0.8)
+    ui.navigate.reload()
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +175,8 @@ def _render_poller_control() -> None:
                         poller.start()
                     _update_poller_label(status_label, poller)
                     ui.notify("Poller gestartet", type="positive")
+                    # Header-Status aktualisieren (Seite neu laden)
+                    await _delayed_reload()
                 except Exception as exc:
                     ui.notify(f"Fehler: {exc}", type="negative")
 
@@ -172,6 +185,7 @@ def _render_poller_control() -> None:
                     poller.pause()
                     _update_poller_label(status_label, poller)
                     ui.notify("Poller pausiert", type="info")
+                    await _delayed_reload()
                 except Exception as exc:
                     ui.notify(f"Fehler: {exc}", type="negative")
 
@@ -180,6 +194,7 @@ def _render_poller_control() -> None:
                     await poller.stop()
                     _update_poller_label(status_label, poller)
                     ui.notify("Poller gestoppt", type="warning")
+                    await _delayed_reload()
                 except Exception as exc:
                     ui.notify(f"Fehler: {exc}", type="negative")
 

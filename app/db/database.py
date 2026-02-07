@@ -141,9 +141,17 @@ CREATE TABLE IF NOT EXISTS daily_costs (
     haiku_count INTEGER DEFAULT 0,
     opus_count INTEGER DEFAULT 0,
     batch_count INTEGER DEFAULT 0,
-    opus_cost_usd REAL DEFAULT 0.0
+    opus_cost_usd REAL DEFAULT 0.0,
+    sonnet_cost_usd REAL DEFAULT 0.0,
+    haiku_cost_usd REAL DEFAULT 0.0
 );
 """
+
+# Spalten die per ALTER TABLE nachträglich ergänzt werden (AP-09)
+_DAILY_COSTS_MIGRATIONS: list[str] = [
+    "ALTER TABLE daily_costs ADD COLUMN sonnet_cost_usd REAL DEFAULT 0.0",
+    "ALTER TABLE daily_costs ADD COLUMN haiku_cost_usd REAL DEFAULT 0.0",
+]
 
 # Indizes für häufige Abfragen
 _INDEXES = [
@@ -241,6 +249,10 @@ class Database:
         Verwendet CREATE TABLE/INDEX IF NOT EXISTS – idempotent und
         sicher bei mehrfachem Aufruf.  Für spätere Schema-Änderungen
         kann hier eine Versions-basierte Migration ergänzt werden.
+
+        AP-09: ALTER TABLE für Spalten die nachträglich ergänzt wurden.
+        SQLite hat kein ADD COLUMN IF NOT EXISTS, daher per PRAGMA
+        prüfen ob die Spalte bereits existiert.
         """
         conn = self.connection
 
@@ -249,6 +261,21 @@ class Database:
 
         for idx_sql in _INDEXES:
             await conn.execute(idx_sql)
+
+        # AP-09: Nachträgliche Spalten in daily_costs (idempotent)
+        existing_cols = set()
+        cursor = await conn.execute("PRAGMA table_info(daily_costs)")
+        for row in await cursor.fetchall():
+            existing_cols.add(row[1])  # row[1] = column name
+
+        for alter_sql in _DAILY_COSTS_MIGRATIONS:
+            # Spaltennamen aus "ADD COLUMN <name> ..." extrahieren
+            parts = alter_sql.split("ADD COLUMN ", 1)
+            if len(parts) == 2:
+                col_name = parts[1].split()[0]
+                if col_name not in existing_cols:
+                    await conn.execute(alter_sql)
+                    logger.info("Migration: Spalte '%s' zu daily_costs hinzugefügt", col_name)
 
         await conn.commit()
         logger.debug("Schema-Migration abgeschlossen")
@@ -323,6 +350,8 @@ class Database:
         opus_delta = 1 if record.model_used in _OPUS_MODELS else 0
         batch_delta = 1 if record.processing_mode == "batch" else 0
         opus_cost_delta = record.cost_usd if record.model_used in _OPUS_MODELS else 0.0
+        sonnet_cost_delta = record.cost_usd if record.model_used in _SONNET_MODELS else 0.0
+        haiku_cost_delta = record.cost_usd if record.model_used in _HAIKU_MODELS else 0.0
 
         await conn.execute(
             """
@@ -332,14 +361,14 @@ class Database:
                 total_cache_read_tokens, total_cache_creation_tokens,
                 total_cost_usd,
                 sonnet_count, haiku_count, opus_count, batch_count,
-                opus_cost_usd
+                opus_cost_usd, sonnet_cost_usd, haiku_cost_usd
             ) VALUES (
                 ?, 1,
                 ?, ?,
                 ?, ?,
                 ?,
                 ?, ?, ?, ?,
-                ?
+                ?, ?, ?
             )
             ON CONFLICT(date) DO UPDATE SET
                 documents_processed = documents_processed + 1,
@@ -352,7 +381,9 @@ class Database:
                 haiku_count = haiku_count + excluded.haiku_count,
                 opus_count = opus_count + excluded.opus_count,
                 batch_count = batch_count + excluded.batch_count,
-                opus_cost_usd = opus_cost_usd + excluded.opus_cost_usd
+                opus_cost_usd = opus_cost_usd + excluded.opus_cost_usd,
+                sonnet_cost_usd = sonnet_cost_usd + excluded.sonnet_cost_usd,
+                haiku_cost_usd = haiku_cost_usd + excluded.haiku_cost_usd
             """,
             (
                 today_str,
@@ -366,6 +397,8 @@ class Database:
                 opus_delta,
                 batch_delta,
                 opus_cost_delta,
+                sonnet_cost_delta,
+                haiku_cost_delta,
             ),
         )
 
@@ -467,6 +500,8 @@ class Database:
         Liest aus daily_costs (aggregiert) statt aus processed_documents
         (schneller, besonders bei vielen Dokumenten).
 
+        AP-09: Jetzt mit per-Modell-Kosten (sonnet_cost_usd, haiku_cost_usd).
+
         Returns:
             Dict mit Modellnamen als Key, z.B.:
             {"sonnet": {"count": 42, "cost_usd": 1.23}, ...}
@@ -485,6 +520,8 @@ class Database:
                 COALESCE(SUM(opus_count), 0) as opus_count,
                 COALESCE(SUM(batch_count), 0) as batch_count,
                 COALESCE(SUM(opus_cost_usd), 0.0) as opus_cost,
+                COALESCE(SUM(sonnet_cost_usd), 0.0) as sonnet_cost,
+                COALESCE(SUM(haiku_cost_usd), 0.0) as haiku_cost,
                 COALESCE(SUM(total_cost_usd), 0.0) as total_cost
             FROM daily_costs
             WHERE date LIKE ?
@@ -501,25 +538,20 @@ class Database:
         haiku_count = int(row["haiku_count"])
         opus_count = int(row["opus_count"])
         batch_count = int(row["batch_count"])
-        total_cost = float(row["total_cost"])
         opus_cost = float(row["opus_cost"])
-
-        # Sonnet- und Haiku-Kosten werden approximiert:
-        # total_cost - opus_cost = sonnet + haiku
-        # Genauere Aufschlüsselung kommt über processed_documents
-        non_opus_cost = total_cost - opus_cost
+        sonnet_cost = float(row["sonnet_cost"])
+        haiku_cost = float(row["haiku_cost"])
 
         if sonnet_count > 0:
-            result["sonnet"] = {"count": sonnet_count}
+            result["sonnet"] = {"count": sonnet_count, "cost_usd": sonnet_cost}
         if haiku_count > 0:
-            result["haiku"] = {"count": haiku_count}
+            result["haiku"] = {"count": haiku_count, "cost_usd": haiku_cost}
         if opus_count > 0:
             result["opus"] = {"count": opus_count, "cost_usd": opus_cost}
         if batch_count > 0:
+            # Batch-Kosten: nicht separat getrackt, da Batch-Docs
+            # bereits in sonnet/haiku/opus enthalten sind
             result["batch"] = {"count": batch_count}
-
-        # Gesamtkosten-Aufschlüsselung aus processed_documents
-        # (genauer, aber langsamer – nur auf Anfrage in Phase 2)
 
         return result
 
@@ -799,3 +831,102 @@ class Database:
         if not row or int(row["count"]) == 0:
             return 0.0
         return float(row["total"]) / int(row["count"])
+
+    async def get_avg_tokens_per_document(
+        self,
+        year: int | None = None,
+        month: int | None = None,
+    ) -> dict[str, float]:
+        """Durchschnittliche Token-Zahlen pro Dokument im Monat.
+
+        Returns:
+            Dict mit "input" und "output" als Durchschnittswerte.
+        """
+        now = date.today()
+        y = year or now.year
+        m = month or now.month
+        prefix = f"{y:04d}-{m:02d}-%"
+
+        conn = self.connection
+        cursor = await conn.execute(
+            """
+            SELECT
+                COALESCE(SUM(total_input_tokens), 0) as total_in,
+                COALESCE(SUM(total_output_tokens), 0) as total_out,
+                COALESCE(SUM(total_cache_read_tokens), 0) as total_cache_r,
+                COALESCE(SUM(documents_processed), 0) as count
+            FROM daily_costs
+            WHERE date LIKE ?
+            """,
+            (prefix,),
+        )
+        row = await cursor.fetchone()
+        if not row or int(row["count"]) == 0:
+            return {"input": 0.0, "output": 0.0}
+
+        count = int(row["count"])
+        # Input-Tokens inkl. Cache-Read (= effektiv gelesene Tokens)
+        total_in = int(row["total_in"]) + int(row["total_cache_r"])
+        total_out = int(row["total_out"])
+        return {
+            "input": total_in / count,
+            "output": total_out / count,
+        }
+
+    async def get_cache_savings(
+        self,
+        year: int | None = None,
+        month: int | None = None,
+    ) -> float:
+        """Geschätzte Cache-Ersparnis im Monat in USD.
+
+        Berechnung: Cache-Read-Tokens hätten ohne Cache den vollen
+        Input-Preis gekostet.  Die Differenz zum Cache-Read-Preis
+        ist die Ersparnis.  Da wir nicht wissen, welches Modell die
+        Cache-Tokens jeweils erzeugt hat, verwenden wir den gewichteten
+        Durchschnitt aus den Modell-Zählern.
+
+        Returns:
+            Geschätzte Ersparnis in USD.
+        """
+        now = date.today()
+        y = year or now.year
+        m = month or now.month
+        prefix = f"{y:04d}-{m:02d}-%"
+
+        conn = self.connection
+        cursor = await conn.execute(
+            """
+            SELECT
+                COALESCE(SUM(total_cache_read_tokens), 0) as cache_tokens,
+                COALESCE(SUM(sonnet_count), 0) as sonnet_n,
+                COALESCE(SUM(haiku_count), 0) as haiku_n,
+                COALESCE(SUM(opus_count), 0) as opus_n
+            FROM daily_costs
+            WHERE date LIKE ?
+            """,
+            (prefix,),
+        )
+        row = await cursor.fetchone()
+        if not row or int(row["cache_tokens"]) == 0:
+            return 0.0
+
+        cache_tokens = int(row["cache_tokens"])
+        sonnet_n = int(row["sonnet_n"])
+        haiku_n = int(row["haiku_n"])
+        opus_n = int(row["opus_n"])
+        total_n = sonnet_n + haiku_n + opus_n
+
+        if total_n == 0:
+            return 0.0
+
+        # Gewichteter Durchschnitt: Differenz (input_price - cache_read_price)
+        # pro Modell, gewichtet nach Anteil der Dokumente
+        # Sonnet: 3.0 - 0.30 = 2.70 $/MTok Ersparnis
+        # Haiku:  1.0 - 0.10 = 0.90 $/MTok Ersparnis
+        # Opus:   5.0 - 0.50 = 4.50 $/MTok Ersparnis
+        weighted_savings_per_mtok = (
+            sonnet_n * 2.70 + haiku_n * 0.90 + opus_n * 4.50
+        ) / total_n
+
+        return (cache_tokens / 1_000_000) * weighted_savings_per_mtok

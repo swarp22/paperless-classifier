@@ -202,7 +202,14 @@ def _render_counter_cards(data: dict[str, Any]) -> None:
 
 
 def _render_recent_documents(docs: list[dict[str, Any]]) -> None:
-    """Rendert die Tabelle der letzten verarbeiteten Dokumente."""
+    """Rendert die Tabelle der letzten verarbeiteten Dokumente.
+
+    Paperless-ID ist ein klickbarer Link zur Paperless-Detailseite.
+    """
+    from app.config import get_settings
+
+    paperless_url = get_settings().paperless_url
+
     with ui.card().classes("w-full"):
         ui.label("Letzte Verarbeitungen").classes(
             "text-sm text-gray-500 font-medium mb-2"
@@ -272,6 +279,20 @@ def _render_recent_documents(docs: list[dict[str, Any]]) -> None:
         ).classes("w-full")
         table.props("dense flat bordered")
 
+        # Paperless-ID als klickbaren Link rendern
+        table.add_slot(
+            "body-cell-id",
+            f'''
+            <q-td :props="props">
+                <a :href="'{paperless_url}/documents/' + props.row.paperless_id + '/details'"
+                   target="_blank"
+                   class="text-blue-600 hover:underline font-medium">
+                    {{{{ props.row.paperless_id }}}}
+                </a>
+            </q-td>
+            ''',
+        )
+
 
 # ---------------------------------------------------------------------------
 # Seiten-Definition
@@ -283,8 +304,20 @@ def register(app: Any = None) -> None:
     @ui.page("/")
     async def dashboard_page() -> None:
         with page_layout("Dashboard"):
-            data = await _load_dashboard_data()
+            # Container für dynamischen Inhalt (Auto-Refresh)
+            content = ui.column().classes("w-full gap-4")
 
-            _render_poller_status(data["poller"])
-            _render_counter_cards(data)
-            _render_recent_documents(data["recent_docs"])
+            async def render_content() -> None:
+                """Lädt Daten und rendert alle Dashboard-Komponenten."""
+                content.clear()
+                data = await _load_dashboard_data()
+                with content:
+                    _render_poller_status(data["poller"])
+                    _render_counter_cards(data)
+                    _render_recent_documents(data["recent_docs"])
+
+            # Initialer Render
+            await render_content()
+
+            # Auto-Refresh Timer (alle 30s)
+            ui.timer(30.0, render_content)
