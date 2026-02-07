@@ -252,6 +252,7 @@ async def async_startup() -> None:
             pipeline=state.pipeline,
             settings=settings,
             cost_tracker=state.cost_tracker,
+            database=state.database,
         )
         state.poller.start()
         logger.info("Poller gestartet")

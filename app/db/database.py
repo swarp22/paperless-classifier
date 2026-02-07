@@ -10,7 +10,11 @@ Tabellen (Phase 1):
 - processed_documents: Verarbeitungshistorie pro Dokument-Versuch
 - daily_costs: Aggregierte Tageskosten für schnelle Dashboard-Abfragen
 
-Tabellen für Phase 3 (Schema-Analyse) werden hier NICHT angelegt.
+Tabellen (Phase 3 – Schema-Analyse, AP-10):
+- schema_title_patterns: Erkannte Titel-Schemata (Ebene 1)
+- schema_path_rules: Pfad-Logik-Regeln (Ebene 2)
+- schema_mapping_matrix: Zuordnungen Korrespondent × Typ → Pfad (Ebene 3)
+- schema_analysis_runs: Audit-Log (wann/warum/Ergebnis)
 """
 
 from __future__ import annotations
@@ -153,6 +157,100 @@ _DAILY_COSTS_MIGRATIONS: list[str] = [
     "ALTER TABLE daily_costs ADD COLUMN haiku_cost_usd REAL DEFAULT 0.0",
 ]
 
+# ---------------------------------------------------------------------------
+# Schema-Analyse-Tabellen (AP-10, Phase 3)
+# ---------------------------------------------------------------------------
+
+_SCHEMA_TITLE_PATTERNS = """
+CREATE TABLE IF NOT EXISTS schema_title_patterns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_type TEXT NOT NULL,
+    correspondent TEXT NOT NULL,
+    title_template TEXT NOT NULL,
+    rule_description TEXT,
+    confidence TEXT NOT NULL DEFAULT 'medium',
+    document_count INTEGER DEFAULT 0,
+    outlier_count INTEGER DEFAULT 0,
+    outlier_titles TEXT,
+    examples TEXT,
+    is_manual BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    UNIQUE(document_type, correspondent)
+);
+"""
+
+_SCHEMA_PATH_RULES = """
+CREATE TABLE IF NOT EXISTS schema_path_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    topic TEXT NOT NULL,
+    rule_description TEXT NOT NULL,
+    path_template TEXT NOT NULL,
+    examples TEXT,
+    topic_document_count INTEGER DEFAULT 0,
+    normalization_suggestions TEXT,
+    confidence TEXT NOT NULL DEFAULT 'medium',
+    is_manual BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    UNIQUE(topic)
+);
+"""
+
+_SCHEMA_MAPPING_MATRIX = """
+CREATE TABLE IF NOT EXISTS schema_mapping_matrix (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    correspondent TEXT NOT NULL,
+    document_type TEXT,
+    storage_path_name TEXT NOT NULL,
+    storage_path_id INTEGER,
+    mapping_type TEXT NOT NULL DEFAULT 'exact',
+    condition_description TEXT,
+    document_count INTEGER DEFAULT 0,
+    confidence TEXT NOT NULL DEFAULT 'medium',
+    is_manual BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    UNIQUE(correspondent, document_type, storage_path_name)
+);
+"""
+
+_SCHEMA_ANALYSIS_RUNS = """
+CREATE TABLE IF NOT EXISTS schema_analysis_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    trigger_type TEXT NOT NULL,
+    total_documents INTEGER DEFAULT 0,
+    docs_since_last_run INTEGER DEFAULT 0,
+    -- Titel-Schemata
+    title_schemas_created INTEGER DEFAULT 0,
+    title_schemas_updated INTEGER DEFAULT 0,
+    title_schemas_unchanged INTEGER DEFAULT 0,
+    -- Pfad-Regeln
+    path_rules_created INTEGER DEFAULT 0,
+    path_rules_updated INTEGER DEFAULT 0,
+    -- Zuordnungsmatrix
+    mappings_created INTEGER DEFAULT 0,
+    mappings_updated INTEGER DEFAULT 0,
+    -- Allgemein
+    manual_entries_preserved INTEGER DEFAULT 0,
+    suggestions_count INTEGER DEFAULT 0,
+    suggestions_json TEXT,
+    -- Kosten (nur bei Opus-Lauf in AP-11 relevant, hier schon angelegt)
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    cost_usd REAL DEFAULT 0.0,
+    model_used TEXT,
+    -- Status
+    status TEXT NOT NULL DEFAULT 'completed',
+    error_message TEXT,
+    raw_response TEXT
+);
+"""
+
 # Indizes für häufige Abfragen
 _INDEXES = [
     # Lookups nach Paperless-Dokument-ID (Mehrfachverarbeitung möglich)
@@ -166,6 +264,16 @@ _INDEXES = [
     # Review-Queue: Dokumente mit Status "review" finden
     "CREATE INDEX IF NOT EXISTS idx_pd_status "
     "ON processed_documents(status);",
+
+    # Schema-Analyse: Schnelle Lookups (AP-10)
+    "CREATE INDEX IF NOT EXISTS idx_stp_doctype_corr "
+    "ON schema_title_patterns(document_type, correspondent);",
+
+    "CREATE INDEX IF NOT EXISTS idx_smm_correspondent "
+    "ON schema_mapping_matrix(correspondent);",
+
+    "CREATE INDEX IF NOT EXISTS idx_sar_run_at "
+    "ON schema_analysis_runs(run_at DESC);",
 ]
 
 # Modell-Klassifikation für daily_costs-Zähler
@@ -258,6 +366,12 @@ class Database:
 
         await conn.execute(_SCHEMA_PROCESSED_DOCUMENTS)
         await conn.execute(_SCHEMA_DAILY_COSTS)
+
+        # Schema-Analyse-Tabellen (AP-10)
+        await conn.execute(_SCHEMA_TITLE_PATTERNS)
+        await conn.execute(_SCHEMA_PATH_RULES)
+        await conn.execute(_SCHEMA_MAPPING_MATRIX)
+        await conn.execute(_SCHEMA_ANALYSIS_RUNS)
 
         for idx_sql in _INDEXES:
             await conn.execute(idx_sql)
@@ -930,3 +1044,68 @@ class Database:
         ) / total_n
 
         return (cache_tokens / 1_000_000) * weighted_savings_per_mtok
+
+    # --- Schema-Analyse (AP-10) ---
+
+    async def get_last_schema_analysis_run(self) -> dict[str, Any] | None:
+        """Gibt den letzten erfolgreichen Schema-Analyse-Lauf zurück.
+
+        Returns:
+            Dict mit allen Feldern oder None wenn noch nie gelaufen.
+        """
+        conn = self.connection
+        cursor = await conn.execute(
+            """
+            SELECT * FROM schema_analysis_runs
+            WHERE status = 'completed'
+            ORDER BY run_at DESC
+            LIMIT 1
+            """,
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def get_documents_processed_since(
+        self,
+        since_timestamp: str,
+    ) -> int:
+        """Anzahl der Dokumente, die seit einem Zeitpunkt verarbeitet wurden.
+
+        Zählt aus processed_documents (nicht aus Paperless direkt),
+        da wir nur erfolgreich verarbeitete Dokumente zählen wollen.
+
+        Args:
+            since_timestamp: ISO-Timestamp als String (aus schema_analysis_runs.run_at).
+
+        Returns:
+            Anzahl neuer verarbeiteter Dokumente seit dem Zeitpunkt.
+        """
+        conn = self.connection
+        cursor = await conn.execute(
+            """
+            SELECT COUNT(DISTINCT paperless_id)
+            FROM processed_documents
+            WHERE processed_at > ?
+              AND status IN ('classified', 'review', 'applied')
+            """,
+            (since_timestamp,),
+        )
+        row = await cursor.fetchone()
+        return int(row[0]) if row else 0
+
+    async def get_total_documents_processed(self) -> int:
+        """Gesamtzahl jemals verarbeiteter Dokumente (unique paperless_ids).
+
+        Returns:
+            Anzahl eindeutiger Paperless-Dokument-IDs.
+        """
+        conn = self.connection
+        cursor = await conn.execute(
+            """
+            SELECT COUNT(DISTINCT paperless_id)
+            FROM processed_documents
+            WHERE status IN ('classified', 'review', 'applied')
+            """,
+        )
+        row = await cursor.fetchone()
+        return int(row[0]) if row else 0

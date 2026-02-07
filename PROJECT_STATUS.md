@@ -3,7 +3,7 @@
 Dieses Dokument dient als Chat-übergreifender Kontext für die Entwicklung
 mit Claude. Es wird nach jedem abgeschlossenen Arbeitspaket aktualisiert.
 
-**Letzte Aktualisierung:** 2026-02-07, nach AP-09
+**Letzte Aktualisierung:** 2026-02-07, nach AP-10
 
 ---
 
@@ -69,72 +69,63 @@ mit Claude. Es wird nach jedem abgeschlossenen Arbeitspaket aktualisiert.
   - Model Routing validiert: 7× Haiku ($0.09), 3× Sonnet ($0.20)
   - Mapping-Auflösung: 100% exakt, kein Fuzzy-Match nötig
 - **Fix E-009:** Race Condition bei Multi-PATCH → Single-PATCH-Architektur
-  - `_apply_result()` sendet alle Änderungen in einem PATCH
 - **Fix E-010:** Rate-Limit (429/529) → Zyklusabbruch statt Error-Markierung
-  - 2s Delay zwischen Dokumenten (`DOCUMENT_DELAY_SECONDS`)
-  - ClaudeAPIError mit status_code wird an Poller weitergereicht
 - **Fix E-011:** Haus-Register/Ordnungszahl bei digitalen Dokumenten unterdrückt
-  - Resolver prüft jetzt `is_scanned_document` + `pagination_stamp is None`
-  - Pipeline entfernt Haus-Felder bei digitalen PDFs (analog Paginierung)
 - **E-012 (Eselsohr):** Steuer-Tag-Neuanlage nutzt nicht create_new-Mechanismus → Phase 3
 
 ### AP-06: SQLite State-Management ✓
 - `app/db/database.py`: SQLite-Schema (WAL-Modus, Indizes), async via aiosqlite
   - Tabelle `processed_documents`: Verarbeitungshistorie pro Pipeline-Durchlauf
   - Tabelle `daily_costs`: Aggregierte Tageskosten (UPSERT bei jedem Insert)
-  - Abfrage-Methoden: get_monthly_cost, get_daily_cost, get_model_breakdown, get_recent_documents
 - Pipeline-Integration: `_persist_result()` im finally-Block (Schritt 10)
-  - Schreibt bei Erfolg und Fehler (sofern API-Aufruf stattfand)
 - CostTracker-Migration: `is_limit_reached()`, `get_monthly_cost()` etc. jetzt async
-  - SQLite als primäre Quelle, In-Memory-Fallback ohne DB
-  - `set_database()` wird in main.py nach DB-Init aufgerufen
-- Aufrufer-Anpassungen: `ClaudeClient._check_cost_limit()` und `Poller._is_cost_limit_reached()` jetzt async
-- **ERRATA E-013:** DB-Modul in `app/db/` statt `app/database.py`
-- **ERRATA E-014:** CostTracker-Methoden async (Breaking Change, alle Aufrufer angepasst)
-- **ERRATA E-015:** Schema-Abweichungen (paperless_id nicht UNIQUE, duration_seconds + error_message ergänzt, Cache-Token in daily_costs)
+- **ERRATA:** E-013 bis E-015
 
 ### AP-07: Web-UI Basis ✓
 - NiceGUI-Grundgerüst mit Sidebar-Navigation und Header
-- `app/ui/layout.py`: Wiederverwendbares Layout (Sidebar + Content)
-- `app/ui/dashboard.py`: Poller-Status, Zähler-Karten (Heute/Woche/Monat), Dokumenten-Tabelle
-- `app/ui/costs.py`: Kosten-Übersicht mit ECharts-Tagesdiagramm, Modell-Badges
-- `app/ui/settings.py`: Verbindungsstatus-Prüfung, Config-Anzeige, Poller-Steuerung
-- `app/ui/logs.py`: Log-Viewer mit Level-Filter, Traceback-Gruppierung
-- `app/state.py`: Getter-Funktionen ausgelagert (E-017: verhindert doppelte Startup-Registrierung)
+- Dashboard, Kosten, Settings, Log-Viewer
 - **ERRATA:** E-016 bis E-022
 
 ### AP-08: Review-Queue ✓
-- `app/ui/review.py`: Vollständige Review-Queue mit Approve/Reject/Edit
-- Vorschau aller Claude-Zuordnungen (Korrespondent, Typ, Tags, Pfad, Custom Fields, Titel)
-- Direkte Neuanlage von Korrespondenten/Dokumenttypen/Tags aus der Review-Queue
-- Freitext-Bearbeitung aller Felder vor der Anwendung
-- Badge-Zähler im Sidebar-Menü, Poller-Status-Chip im Header
+- Vollständige Review-Queue mit Approve/Reject/Edit
+- Direkte Neuanlage von Korrespondenten/Dokumenttypen/Tags
 - **ERRATA:** E-023 bis E-029
 
 ### AP-09: Kosten-Dashboard & UI-Polish ✓
-- Kosten-Seite: Woche-Karte, Modell-Kosten mit Prozentanteil, Ø Tokens/Dokument, Cache-Ersparnis
-- DB-Migration: daily_costs um sonnet_cost_usd/haiku_cost_usd (ALTER TABLE, idempotent)
-- Neue DB-Methoden: get_avg_tokens_per_document(), get_cache_savings()
-- Auto-Refresh: Dashboard (30s), Kosten (30s), Log-Viewer (5s Toggle)
-- Dashboard: Paperless-ID als klickbarer Link zur Dokumentdetailseite
-- Log-Viewer: Textsuche, Component-Filter, Auto-Refresh-Switch
-- Settings: Header-Chip synchronisiert sich nach Poller-Steuerung (Delayed Reload)
+- Modell-Kosten mit Prozentanteil, Cache-Ersparnis, Auto-Refresh
+- DB-Migration: daily_costs um sonnet_cost_usd/haiku_cost_usd
 - **ERRATA:** E-030 bis E-032
 
-## Nächstes Arbeitspaket
+### AP-10: Schema-Analyse – Collector & Datenmodell ✓
+- **SQLite-Schema:** 4 neue Tabellen + 3 Indizes
+  - `schema_title_patterns`: Titel-Schemata pro (Dokumenttyp, Korrespondent)
+  - `schema_path_rules`: Pfad-Organisationsregeln pro Topic
+  - `schema_mapping_matrix`: Zuordnungen (Korrespondent + Typ) → Pfad
+  - `schema_analysis_runs`: Audit-Log mit Token/Kosten/Status
+- **Storage-Modul** (`app/schema_matrix/storage.py`):
+  - SchemaStorage: Upsert mit is_manual-Schutz (force=False überspringt manuelle Einträge)
+  - CRUD für alle 3 Tabellen + Statistiken + set_manual_flag()
+- **Collector-Modul** (`app/schema_matrix/collector.py`):
+  - Datensammlung aus Paperless (alle Dokumente, ungefiltert)
+  - Ebene 1: Titel-Gruppierung nach (Dokumenttyp, Korrespondent)
+  - Ebene 2: Pfad-Hierarchie-Zerlegung (" / "-Separator), Topic-Gruppierung
+  - Ebene 3: Zuordnungstabelle mit Eindeutigkeitserkennung
+  - Änderungserkennung + `serialize_for_prompt()` für Opus-Prompt
+- **Trigger-Modul** (`app/schema_matrix/trigger.py`):
+  - 3 Auslöser: Wöchentlich (168h), Schwellwert (≥20 Docs), Manuell (AP-12)
+  - Mindestabstand 24h, `get_status()` für UI
+- **Poller-Integration:**
+  - `_check_schema_trigger()` in `_run_loop()` – nur Logging bis AP-11
+  - `main.py` übergibt `database=state.database` an Poller
 
-**AP-10: Schema-Analyse – Collector & Datenmodell (Phase 3)**
-- SQLite-Tabellen: schema_title_patterns, schema_path_rules, schema_mapping_matrix, schema_analysis_runs
-- Collector: Titel/Typ/Korrespondent/Pfad aus Paperless sammeln und vorverarbeiten
-- Gruppierung: Titel nach (Dokumenttyp, Korrespondent), Pfad-Hierarchie extrahieren
-- Trigger-Logik: Wöchentlich + Schwellwert (≥20 neue Docs) + manuell
-- Design-Dokument: Abschnitt 8 (Schema-Analyse) + Abschnitt 6 (Datenmodell)
+## Nächstes Arbeitspaket
 
 **AP-11: Schema-Analyse – Opus-Analyse & Prompt-Builder**
 - Opus-API-Aufruf: Analyse-Prompt mit vorverarbeiteten Collector-Daten
 - Response-Parsing: JSON → SQLite (Titel-Schemata, Pfad-Regeln, Matrix)
 - Prompt-Builder: Schema-Regeln in den Klassifizierungs-System-Prompt einbetten
 - Upsert-Logik: Manuelle Einträge (is_manual=TRUE) nicht überschreiben
+- Poller-Integration: Trigger → Collector → Opus → Storage → Audit-Log
 
 **AP-12: Schema-Analyse – Web-UI**
 - Drei Tabs: Titel-Schemata, Pfad-Regeln, Zuordnungsmatrix
@@ -147,9 +138,12 @@ mit Claude. Es wird nach jedem abgeschlossenen Arbeitspaket aktualisiert.
 ```python
 default_model = "claude-sonnet-4-5-20250929"
 batch_model = "claude-sonnet-4-5-20250929"
-schema_matrix_model = "claude-opus-4-6"        # geändert von opus-4-5, siehe ERRATA E-007
+schema_matrix_model = "claude-opus-4-6"
 monthly_cost_limit_usd = 25.0
-polling_interval_seconds = 300                  # 5 Minuten
+polling_interval_seconds = 300
+schema_matrix_schedule = "weekly"
+schema_matrix_threshold = 20
+schema_matrix_min_interval_h = 24
 ```
 
 ## Paperless-Stammdaten (Kurzfassung)
@@ -166,46 +160,51 @@ paperless-classifier/
 │   ├── main.py                    # NiceGUI Einstiegspunkt
 │   ├── config.py                  # Pydantic Settings
 │   ├── logging_config.py          # Logging-Konfiguration
-│   ├── state.py                   # Globale Laufzeit-Objekte + Getter (AP-07)
+│   ├── state.py                   # Globale Laufzeit-Objekte + Getter
 │   ├── health.py                  # Health-Check-Logik
 │   ├── claude/                    # AP-03
 │   │   ├── __init__.py
 │   │   ├── client.py
 │   │   ├── cost_tracker.py
 │   │   └── prompts.py
-│   ├── db/                        # AP-06 + AP-09
+│   ├── db/                        # AP-06 + AP-09 + AP-10
 │   │   ├── __init__.py
-│   │   └── database.py           # SQLite (daily_costs mit per-Modell-Kosten)
-│   ├── classifier/                # AP-04 + Fixes aus AP-05
+│   │   └── database.py
+│   ├── classifier/                # AP-04 + AP-05
 │   │   ├── __init__.py
-│   │   ├── model_router.py        # PDF-Analyse + Modellwahl
-│   │   ├── resolver.py            # Name→ID Mapping (Fuzzy)
-│   │   ├── confidence.py          # Confidence-Bewertung
-│   │   └── pipeline.py            # Orchestrierung (10-Schritte-Flow)
+│   │   ├── model_router.py
+│   │   ├── resolver.py
+│   │   ├── confidence.py
+│   │   └── pipeline.py
 │   ├── paperless/                 # AP-02
 │   │   ├── __init__.py
 │   │   ├── cache.py
 │   │   ├── client.py
 │   │   ├── exceptions.py
 │   │   └── models.py
-│   ├── scheduler/                 # AP-05
+│   ├── scheduler/                 # AP-05 + AP-10
 │   │   ├── __init__.py
 │   │   └── poller.py
+│   ├── schema_matrix/             # AP-10
+│   │   ├── __init__.py
+│   │   ├── collector.py
+│   │   ├── storage.py
+│   │   └── trigger.py
 │   └── ui/                        # AP-07 + AP-08 + AP-09
-│       ├── __init__.py            # register_pages()
-│       ├── layout.py              # Sidebar + Header Layout
-│       ├── dashboard.py           # Startseite (Auto-Refresh 30s)
-│       ├── costs.py               # Kosten-Dashboard (Auto-Refresh 30s)
-│       ├── review.py              # Review-Queue mit Approve/Reject/Edit
-│       ├── settings.py            # Config-Anzeige + Poller-Steuerung
-│       └── logs.py                # Log-Viewer (Suche, Filter, Auto-Refresh)
+│       ├── __init__.py
+│       ├── layout.py
+│       ├── dashboard.py
+│       ├── costs.py
+│       ├── review.py
+│       ├── settings.py
+│       └── logs.py
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
 ├── .env.example
 ├── .gitignore
-├── ERRATA.md                      # Abweichungen zur Design-Doku (E-001 bis E-032)
-├── PROJECT_STATUS.md              # ← Dieses Dokument
+├── ERRATA.md                      # E-001 bis E-032
+├── PROJECT_STATUS.md
 └── README.md
 ```
 

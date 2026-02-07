@@ -6,6 +6,9 @@ Intervallen ob neue Dokumente mit Tag "NEU" in Paperless vorliegen.
 Gefundene Dokumente werden sequenziell über die ClassificationPipeline
 verarbeitet.  Fehler bei einzelnen Dokumenten stoppen den Loop nicht.
 
+Prüft zusätzlich bei jedem Durchlauf ob die Schema-Analyse
+ausgelöst werden soll (AP-10, Phase 3).
+
 Steuerung über die Web-UI (Start/Stop/Pause) wird über Methoden am
 Poller-Objekt ermöglicht – die UI selbst kommt in einem späteren AP.
 """
@@ -22,10 +25,12 @@ from app.classifier.pipeline import ClassificationPipeline, PipelineResult
 from app.classifier.resolver import TAG_NEU_ID
 from app.claude.client import ClaudeAPIError, CostLimitReachedError
 from app.logging_config import get_logger
+from app.schema_matrix.trigger import SchemaTrigger
 
 if TYPE_CHECKING:
     from app.claude.cost_tracker import CostTracker
     from app.config import Settings
+    from app.db.database import Database
     from app.paperless.client import PaperlessClient
 
 logger = get_logger("scheduler")
@@ -94,6 +99,7 @@ class Poller:
         pipeline: ClassificationPipeline,
         settings: Settings,
         cost_tracker: CostTracker | None = None,
+        database: Database | None = None,
     ) -> None:
         """Initialisiert den Poller.
 
@@ -102,17 +108,24 @@ class Poller:
             pipeline: Konfigurierte ClassificationPipeline.
             settings: Anwendungseinstellungen (Intervall, Kostenlimit).
             cost_tracker: Optionaler CostTracker für Kostenlimit-Prüfung.
+            database: Optionale Database-Instanz für Schema-Trigger (AP-10).
         """
         self._paperless = paperless
         self._pipeline = pipeline
         self._settings = settings
         self._cost_tracker = cost_tracker
+        self._database = database
 
         self._task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
         self._pause_event = asyncio.Event()
         # Nicht gesetzt = nicht pausiert → Verarbeitung läuft
         self._pause_event.set()
+
+        # Schema-Trigger nur erstellen wenn DB verfügbar (AP-10)
+        self._schema_trigger: SchemaTrigger | None = None
+        if database is not None:
+            self._schema_trigger = SchemaTrigger(database, settings)
 
         self.status = PollerStatus()
 
@@ -230,6 +243,9 @@ class Poller:
 
                 # Dokumente mit Tag "NEU" suchen
                 await self._process_pending_documents()
+
+                # Schema-Analyse-Trigger prüfen (AP-10)
+                await self._check_schema_trigger()
 
                 # Bis zum nächsten Zyklus warten
                 await self._sleep_until_next_cycle()
@@ -446,6 +462,40 @@ class Poller:
                         await task
                     except asyncio.CancelledError:
                         pass
+
+    async def _check_schema_trigger(self) -> None:
+        """Prüft ob die Schema-Analyse ausgelöst werden soll.
+
+        In AP-10 wird nur geloggt – die eigentliche Analyse (Collector +
+        Opus-Aufruf) wird in AP-11 implementiert.  Fehler hier dürfen
+        den Polling-Loop nicht unterbrechen.
+        """
+        if self._schema_trigger is None:
+            return
+
+        try:
+            should_run, reason = await self._schema_trigger.should_run()
+
+            if should_run:
+                logger.info(
+                    "Schema-Trigger ausgelöst: %s – "
+                    "Analyse noch nicht implementiert (→ AP-11)",
+                    reason,
+                )
+                # TODO AP-11: Hier Collector + Opus-Analyse starten
+                #   collector = SchemaCollector(self._paperless, cache)
+                #   result = await collector.collect(...)
+                #   ... Opus-Analyse + Storage ...
+            else:
+                logger.debug("Schema-Trigger: %s", reason)
+
+        except Exception as exc:
+            # Schema-Trigger-Fehler darf Poller nie stoppen
+            logger.warning(
+                "Schema-Trigger-Prüfung fehlgeschlagen: %s",
+                exc,
+                exc_info=True,
+            )
 
     async def _sleep_until_next_cycle(self) -> None:
         """Wartet das konfigurierte Polling-Intervall ab.
