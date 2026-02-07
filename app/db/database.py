@@ -500,6 +500,7 @@ class Database:
         sonnet_count = int(row["sonnet_count"])
         haiku_count = int(row["haiku_count"])
         opus_count = int(row["opus_count"])
+        batch_count = int(row["batch_count"])
         total_cost = float(row["total_cost"])
         opus_cost = float(row["opus_cost"])
 
@@ -628,3 +629,86 @@ class Database:
 
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
+
+    # --- Wochen-/Tages-Abfragen (AP-07: Dashboard) ---
+
+    async def get_weekly_cost(self) -> float:
+        """Kosten der aktuellen Kalenderwoche (Montag bis heute).
+
+        Returns:
+            Gesamtkosten in USD.
+        """
+        conn = self.connection
+        cursor = await conn.execute(
+            """
+            SELECT COALESCE(SUM(total_cost_usd), 0.0)
+            FROM daily_costs
+            WHERE date >= date('now', 'weekday 1', '-7 days')
+              AND date <= date('now')
+            """,
+        )
+        row = await cursor.fetchone()
+        return float(row[0]) if row else 0.0
+
+    async def get_weekly_document_count(self) -> int:
+        """Anzahl verarbeiteter Dokumente in der aktuellen Kalenderwoche.
+
+        Returns:
+            Anzahl Dokumente.
+        """
+        conn = self.connection
+        cursor = await conn.execute(
+            """
+            SELECT COALESCE(SUM(documents_processed), 0)
+            FROM daily_costs
+            WHERE date >= date('now', 'weekday 1', '-7 days')
+              AND date <= date('now')
+            """,
+        )
+        row = await cursor.fetchone()
+        return int(row[0]) if row else 0
+
+    async def get_today_document_count(self) -> int:
+        """Anzahl verarbeiteter Dokumente heute.
+
+        Returns:
+            Anzahl Dokumente.
+        """
+        conn = self.connection
+        cursor = await conn.execute(
+            "SELECT COALESCE(documents_processed, 0) FROM daily_costs "
+            "WHERE date = date('now')",
+        )
+        row = await cursor.fetchone()
+        return int(row[0]) if row else 0
+
+    async def get_avg_cost_per_document(
+        self,
+        year: int | None = None,
+        month: int | None = None,
+    ) -> float:
+        """Durchschnittliche Kosten pro Dokument im Monat.
+
+        Returns:
+            Durchschnitt in USD, 0.0 wenn keine Dokumente.
+        """
+        now = date.today()
+        y = year or now.year
+        m = month or now.month
+        prefix = f"{y:04d}-{m:02d}-%"
+
+        conn = self.connection
+        cursor = await conn.execute(
+            """
+            SELECT
+                COALESCE(SUM(total_cost_usd), 0.0) as total,
+                COALESCE(SUM(documents_processed), 0) as count
+            FROM daily_costs
+            WHERE date LIKE ?
+            """,
+            (prefix,),
+        )
+        row = await cursor.fetchone()
+        if not row or int(row["count"]) == 0:
+            return 0.0
+        return float(row["total"]) / int(row["count"])

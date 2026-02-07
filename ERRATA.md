@@ -271,3 +271,35 @@ await self._paperless.update_document(doc_id, **patch)
 4. **`daily_costs`: Cache-Token-Spalten ergänzt:** `total_cache_read_tokens` und `total_cache_creation_tokens` hinzugefügt. Das Design hatte nur `total_input_tokens` und `total_output_tokens`. Cache-Tokens sind für genaue Kostenanalyse nötig.
 
 5. **DB-Persistierung im `finally`-Block:** Das Design sieht Schritt 10 als separaten Erfolgs-Schritt. Tatsächlich wird im `finally`-Block persistiert (aber nur wenn der API-Aufruf stattfand), damit auch Fehler-Fälle mit Kostendaten erfasst werden.
+
+---
+
+## E-016: AP-Nummerierung verschoben – Design +1 ab Phase 2 (AP-07, 2026-02-07)
+
+**Betrifft:** Alle Arbeitspakete ab Phase 2, Design-Dokument Abschnitt 11
+
+**Problem:** Das Design-Dokument und die ursprünglichen AP-Dateien nummerieren die Web-UI Basis als AP-06. Durch das Einschieben von "SQLite State-Management" als eigenständiges AP-06 verschiebt sich alles um +1:
+
+| Aufgabe | Design-Nummer | Tatsächliche Nummer |
+|---|---|---|
+| SQLite State-Management | (Teil von AP-05/06) | **AP-06** |
+| Web-UI Basis | AP-06 | **AP-07** |
+| Review Queue | AP-07 | **AP-08** |
+| Kosten-Dashboard & Logs | AP-08 | **AP-09** |
+| ... | AP-N | **AP-(N+1)** |
+
+**Auswirkung:** Die Datei `07-webui-review-queue.md` aus dem ursprünglichen Planungsstand beschreibt die Review Queue, nicht die Web-UI Basis. Bei neuen Chats gilt: AP-Nummern aus PROJECT_STATUS.md sind die Source of Truth, nicht die Dateinamen der ursprünglichen AP-Beschreibungen.
+
+**Hinweis:** Die Phase-Zuordnung bleibt unverändert (Phase 2 = Web-UI Basis, Phase 3 = Review Queue etc.).
+
+---
+
+## E-017: Zirkulärer Import `__main__` vs `app.main` (AP-07, 2026-02-07)
+
+**Betrifft:** `app/main.py`, alle UI-Module
+
+**Problem:** `main.py` wird als `__main__` geladen (Einstiegspunkt). Wenn UI-Module per `from app.main import get_poller` importieren, lädt Python `app.main` als separates Modul und führt den gesamten Module-Level-Code erneut aus – inklusive `app.on_startup()`, was nach dem NiceGUI-Start nicht mehr erlaubt ist (`RuntimeError: Unable to register another startup handler`).
+
+**Lösung:** State und Getter-Funktionen nach `app/state.py` ausgelagert (keine Seiteneffekte). Health-Check-Funktionen nach `app/health.py` ausgelagert. UI-Module importieren nur noch aus `app.state` und `app.health`, nie aus `app.main`.
+
+**Regel:** Kein UI-Modul darf direkt aus `app.main` importieren. Neue Getter/Hilfsfunktionen gehören in `app/state.py` oder dedizierte Module.
