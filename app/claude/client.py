@@ -295,7 +295,7 @@ class ClaudeClient:
         """
         # Vorprüfungen
         self._validate_pdf(pdf_bytes)
-        self._check_cost_limit()
+        await self._check_cost_limit()
 
         used_model = model or self._default_model
 
@@ -459,16 +459,18 @@ class ClaudeClient:
                 "möglicherweise kein gültiges PDF"
             )
 
-    def _check_cost_limit(self) -> None:
+    async def _check_cost_limit(self) -> None:
         """Prüft ob das monatliche Kostenlimit erreicht ist.
+
+        Async seit AP-06: CostTracker liest Monatsdaten aus SQLite.
 
         Raises:
             CostLimitReachedError: Wenn das Limit erreicht ist.
         """
         if not self._cost_tracker or self._monthly_cost_limit_usd <= 0:
             return
-        if self._cost_tracker.is_limit_reached(self._monthly_cost_limit_usd):
-            current = self._cost_tracker.get_monthly_cost()
+        if await self._cost_tracker.is_limit_reached(self._monthly_cost_limit_usd):
+            current = await self._cost_tracker.get_monthly_cost()
             raise CostLimitReachedError(
                 limit_usd=self._monthly_cost_limit_usd,
                 current_usd=current,

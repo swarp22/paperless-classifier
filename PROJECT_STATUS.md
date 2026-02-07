@@ -3,7 +3,7 @@
 Dieses Dokument dient als Chat-übergreifender Kontext für die Entwicklung
 mit Claude. Es wird nach jedem abgeschlossenen Arbeitspaket aktualisiert.
 
-**Letzte Aktualisierung:** 2026-02-06, nach AP-05
+**Letzte Aktualisierung:** 2026-02-07, nach AP-06
 
 ---
 
@@ -78,15 +78,29 @@ mit Claude. Es wird nach jedem abgeschlossenen Arbeitspaket aktualisiert.
   - Pipeline entfernt Haus-Felder bei digitalen PDFs (analog Paginierung)
 - **E-012 (Eselsohr):** Steuer-Tag-Neuanlage nutzt nicht create_new-Mechanismus → Phase 3
 
+### AP-06: SQLite State-Management ✓
+- `app/db/database.py`: SQLite-Schema (WAL-Modus, Indizes), async via aiosqlite
+  - Tabelle `processed_documents`: Verarbeitungshistorie pro Pipeline-Durchlauf
+  - Tabelle `daily_costs`: Aggregierte Tageskosten (UPSERT bei jedem Insert)
+  - Abfrage-Methoden: get_monthly_cost, get_daily_cost, get_model_breakdown, get_recent_documents
+- Pipeline-Integration: `_persist_result()` im finally-Block (Schritt 10)
+  - Schreibt bei Erfolg und Fehler (sofern API-Aufruf stattfand)
+- CostTracker-Migration: `is_limit_reached()`, `get_monthly_cost()` etc. jetzt async
+  - SQLite als primäre Quelle, In-Memory-Fallback ohne DB
+  - `set_database()` wird in main.py nach DB-Init aufgerufen
+- Aufrufer-Anpassungen: `ClaudeClient._check_cost_limit()` und `Poller._is_cost_limit_reached()` jetzt async
+- **ERRATA E-013:** DB-Modul in `app/db/` statt `app/database.py`
+- **ERRATA E-014:** CostTracker-Methoden async (Breaking Change, alle Aufrufer angepasst)
+- **ERRATA E-015:** Schema-Abweichungen (paperless_id nicht UNIQUE, duration_seconds + error_message ergänzt, Cache-Token in daily_costs)
+
 ## Nächstes Arbeitspaket
 
-**AP-06: SQLite State-Management & Persistentes Kosten-Tracking**
-- `app/database.py`: SQLite-Schema, Migrations, Connection-Pool
-- Tabelle `processed_documents`: Verarbeitungshistorie pro Dokument
-- Tabelle `daily_costs`: Aggregierte Tageskosten für Dashboard-Abfragen
-- Pipeline-Integration: PipelineResult → SQLite nach Verarbeitung
-- CostTracker-Migration: Von In-Memory auf SQLite-backed
-- Design-Dokument: Abschnitt 7 (Datenmodell), Abschnitte zu Schema-Analyse-Tabellen erst in Phase 3
+**AP-07: Web-UI Basis (Phase 2)**
+- NiceGUI-Grundgerüst mit Navigation (Sidebar/Header)
+- Dashboard: Poller-Status, letzte Verarbeitungen aus SQLite, Tageskosten
+- Kosten-Übersicht: Monat/Tag, Modell-Aufschlüsselung, Limit-Anzeige
+- Einstellungsseite: Verbindungsstatus, aktuelle Config (read-only zunächst)
+- Design-Dokument: Abschnitt 7 (Web-UI Design)
 
 ## Konfiguration (config.py – aktuelle Werte)
 
@@ -117,6 +131,9 @@ paperless-classifier/
 │   │   ├── client.py
 │   │   ├── cost_tracker.py
 │   │   └── prompts.py
+│   ├── db/                        # AP-06
+│   │   ├── __init__.py
+│   │   └── database.py           # SQLite State-Management
 │   ├── classifier/                # AP-04 + Fixes aus AP-05
 │   │   ├── __init__.py
 │   │   ├── model_router.py        # PDF-Analyse + Modellwahl
@@ -137,7 +154,7 @@ paperless-classifier/
 ├── requirements.txt
 ├── .env.example
 ├── .gitignore
-├── ERRATA.md                      # Abweichungen zur Design-Doku (E-001 bis E-012)
+├── ERRATA.md                      # Abweichungen zur Design-Doku (E-001 bis E-015)
 ├── PROJECT_STATUS.md              # ← Dieses Dokument
 └── README.md
 ```

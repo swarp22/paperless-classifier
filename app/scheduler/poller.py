@@ -223,7 +223,7 @@ class Poller:
                     break
 
                 # Kostenlimit prüfen bevor wir Dokumente suchen
-                if self._is_cost_limit_reached():
+                if await self._is_cost_limit_reached():
                     # Nächsten Zyklus abwarten – vielleicht ist nächsten Monat Budget da
                     await self._sleep_until_next_cycle()
                     continue
@@ -280,7 +280,7 @@ class Poller:
                 break
 
             # Kostenlimit vor jedem Dokument prüfen
-            if self._is_cost_limit_reached():
+            if await self._is_cost_limit_reached():
                 logger.warning(
                     "Kostenlimit erreicht – verbleibende Dokumente werden übersprungen"
                 )
@@ -384,11 +384,13 @@ class Poller:
 
     # --- Hilfsmethoden ---
 
-    def _is_cost_limit_reached(self) -> bool:
+    async def _is_cost_limit_reached(self) -> bool:
         """Prüft ob das monatliche Kostenlimit erreicht ist.
 
         Nutzt den CostTracker direkt, nicht den ClaudeClient –
         der Poller soll schon VOR dem API-Call entscheiden können.
+
+        Async seit AP-06: CostTracker liest Monatsdaten aus SQLite.
         """
         if not self._cost_tracker:
             return False
@@ -397,9 +399,9 @@ class Poller:
         if limit <= 0:
             return False
 
-        if self._cost_tracker.is_limit_reached(limit):
+        if await self._cost_tracker.is_limit_reached(limit):
             if not self.status.cost_limit_paused:
-                current = self._cost_tracker.get_monthly_cost()
+                current = await self._cost_tracker.get_monthly_cost()
                 logger.warning(
                     "Monatliches Kostenlimit erreicht: $%.2f / $%.2f",
                     current, limit,

@@ -184,8 +184,8 @@ class Database:
             ...
     """
 
-    def __init__(self, db_path: Path) -> None:
-        self._db_path = db_path
+    def __init__(self, db_path: Path | str) -> None:
+        self._db_path = Path(db_path) if isinstance(db_path, str) else db_path
         self._connection: aiosqlite.Connection | None = None
 
     async def initialize(self) -> None:
