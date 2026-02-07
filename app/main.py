@@ -29,11 +29,17 @@ logger = get_logger("app")
 # Modul-Level-Referenzen, damit Health-Check und zukünftige UI darauf
 # zugreifen können.  Vor async_startup() sind alle None.
 
+_database: Any = None            # Database | None
 _paperless_client: Any = None   # PaperlessClient | None
 _claude_client: Any = None      # ClaudeClient | None
 _cost_tracker: Any = None       # CostTracker | None
 _pipeline: Any = None           # ClassificationPipeline | None
 _poller: Any = None             # Poller | None
+
+
+def get_database() -> Any:
+    """Gibt die Database-Instanz zurück (für Web-UI in späteren APs)."""
+    return _database
 
 
 def get_poller() -> Any:
@@ -200,15 +206,28 @@ def startup() -> None:
 
 
 async def async_startup() -> None:
-    """Asynchrone Initialisierung: Clients erstellen, Cache laden, Poller starten.
+    """Asynchrone Initialisierung: DB, Clients, Cache, Poller starten.
 
     Wird nach startup() ausgeführt, wenn der Event-Loop bereits läuft.
     Fehler hier sind nicht fatal – der Container läuft weiter im
     degraded-Modus (Health-Check zeigt den Zustand an).
     """
-    global _paperless_client, _claude_client, _cost_tracker, _pipeline, _poller
+    global _database, _paperless_client, _claude_client
+    global _cost_tracker, _pipeline, _poller
 
     settings = get_settings()
+
+    # --- SQLite-Datenbank (AP-06) ---
+    try:
+        from app.db.database import Database
+
+        _database = Database(settings.db_path)
+        await _database.initialize()
+        logger.info("SQLite-Datenbank initialisiert: %s", settings.db_path)
+    except Exception as exc:
+        logger.error("Datenbank konnte nicht initialisiert werden: %s", exc)
+        _database = None
+        # Kein Return – der Classifier kann ohne DB laufen (Degraded-Modus)
 
     # --- PaperlessClient ---
     try:
@@ -246,6 +265,10 @@ async def async_startup() -> None:
 
         _cost_tracker = CostTracker()
 
+        # DB-Backend für persistente Kostenabfragen (AP-06)
+        if _database:
+            _cost_tracker.set_database(_database)
+
         _claude_client = ClaudeClient(
             api_key=settings.anthropic_api_key,
             default_model=settings.default_model,
@@ -267,6 +290,7 @@ async def async_startup() -> None:
             paperless=_paperless_client,
             claude=_claude_client,
             config=PipelineConfig(),
+            database=_database,
         )
         logger.info("ClassificationPipeline erstellt")
     except Exception as exc:
@@ -290,14 +314,15 @@ async def async_startup() -> None:
 
 
 async def shutdown() -> None:
-    """Graceful Shutdown: Poller stoppen, Clients schließen.
+    """Graceful Shutdown: Poller stoppen, Clients und DB schließen.
 
     Wird beim Container-Stop (SIGTERM) aufgerufen.  Reihenfolge:
     1. Poller stoppen (wartet auf aktuelles Dokument)
     2. ClaudeClient schließen
     3. PaperlessClient schließen
+    4. Datenbank schließen
     """
-    global _poller, _claude_client, _paperless_client
+    global _poller, _claude_client, _paperless_client, _database
 
     logger.info("Shutdown eingeleitet...")
 
@@ -327,6 +352,15 @@ async def shutdown() -> None:
         except Exception as exc:
             logger.error("Fehler beim Schließen des PaperlessClients: %s", exc)
         _paperless_client = None
+
+    # Datenbank schließen (AP-06)
+    if _database is not None:
+        try:
+            await _database.close()
+            logger.info("Datenbank geschlossen")
+        except Exception as exc:
+            logger.error("Fehler beim Schließen der Datenbank: %s", exc)
+        _database = None
 
     logger.info("=" * 60)
     logger.info("Paperless Claude Classifier beendet")

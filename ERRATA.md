@@ -223,3 +223,51 @@ await self._paperless.update_document(doc_id, **patch)
 **Problem:** Die Steuer-Tag-Ableitung (`"Steuer {year}"` aus `tax_relevant + tax_year`) sucht den Tag im Cache. Wenn er nicht existiert (z.B. "Steuer 2026" ab Januar 2026), wird nur geloggt – der Tag wird **nicht** in `create_new_tags` aufgenommen. Selbst mit `auto_create_tags=True` würde er daher nicht angelegt.
 
 **Kein Fix nötig jetzt:** Auto-Create ist in Phase 3 vorgesehen ("Neuanlage von Tags/Korrespondenten/Typen/Pfaden" + Confidence-basierte Steuerung). Wenn das aktiviert wird, muss der Resolver den fehlenden Steuer-Tag in `resolved.create_new_tags` aufnehmen, damit `_handle_create_new()` ihn anlegen kann.
+
+---
+
+## E-013: Datenbank-Modul in `app/db/` statt `app/database.py` (AP-06, 2026-02-07)
+
+**Betrifft:** Design-Dokument Abschnitt 3.1 (Verzeichnisstruktur)
+
+**Design:** `app/database.py` als flache Datei.
+
+**Tatsächlich:** `app/db/database.py` als Modul im Paket `app/db/`.
+
+**Grund:** Das Paket `app/db/` existierte bereits als Platzhalter seit AP-01. Ein Paket ist besser erweiterbar (z.B. `app/db/migrations.py` oder `app/db/queries.py` in späteren Phasen) und konsistent mit der Paketstruktur der anderen Module (`app/claude/`, `app/classifier/`, etc.).
+
+---
+
+## E-014: CostTracker-Methoden sind async (AP-06, 2026-02-07)
+
+**Betrifft:** `app/claude/cost_tracker.py`, `app/claude/client.py`, `app/scheduler/poller.py`
+
+**Design:** CostTracker hat synchrone Methoden.
+
+**Tatsächlich:** `get_monthly_cost()`, `get_daily_cost()`, `is_limit_reached()` und `get_model_breakdown()` sind jetzt `async` und lesen aus SQLite. `record()` bleibt synchron (nur In-Memory, wird vom ClaudeClient aufgerufen).
+
+**Aufrufer-Änderungen:**
+- `ClaudeClient._check_cost_limit()` → jetzt `async`, aufgerufen mit `await`
+- `Poller._is_cost_limit_reached()` → jetzt `async`, aufgerufen mit `await`
+
+**Fallback:** Ohne DB-Backend (Tests, Degraded-Modus) fallen die async-Methoden auf die In-Memory-Liste zurück.
+
+**Grund:** SQLite-Zugriff über aiosqlite ist inherent async. Alle Aufrufer befinden sich bereits in async-Kontexten, daher ist die Migration mechanisch und risikoarm. Die Alternative (synchroner Wrapper mit `asyncio.run()`) wäre fehleranfällig in einer bereits laufenden Event-Loop.
+
+---
+
+## E-015: Schema-Abweichungen processed_documents (AP-06, 2026-02-07)
+
+**Betrifft:** Design-Dokument Abschnitt 7 (Datenmodell), Tabelle `processed_documents`
+
+**Änderungen gegenüber Design:**
+
+1. **`paperless_id` ist NICHT UNIQUE:** Dokumente können mehrfach verarbeitet werden (Retry nach Error, manuelles Re-Tagging mit NEU-Tag). Jede Zeile ist ein Verarbeitungsversuch, nicht der Dokumentzustand. Design-Schema hatte `paperless_id INTEGER NOT NULL UNIQUE`.
+
+2. **Spalte `duration_seconds REAL` hinzugefügt:** Verarbeitungsdauer pro Dokument, nützlich für Performance-Monitoring. War im Design nicht vorgesehen.
+
+3. **Spalte `error_message TEXT` hinzugefügt:** Fehlermeldung bei Status "error". Ermöglicht Fehleranalyse ohne Log-Durchsicht.
+
+4. **`daily_costs`: Cache-Token-Spalten ergänzt:** `total_cache_read_tokens` und `total_cache_creation_tokens` hinzugefügt. Das Design hatte nur `total_input_tokens` und `total_output_tokens`. Cache-Tokens sind für genaue Kostenanalyse nötig.
+
+5. **DB-Persistierung im `finally`-Block:** Das Design sieht Schritt 10 als separaten Erfolgs-Schritt. Tatsächlich wird im `finally`-Block persistiert (aber nur wenn der API-Aufruf stattfand), damit auch Fehler-Fälle mit Kostendaten erfasst werden.

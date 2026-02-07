@@ -18,9 +18,10 @@ Die Pipeline ist zustandslos – alle Abhängigkeiten werden injiziert.
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from app.classifier.confidence import (
     ApplyAction,
@@ -51,9 +52,13 @@ from app.claude.client import (
     ConfidenceLevel,
 )
 from app.claude.prompts import PromptData, build_system_prompt
+from app.db.database import ProcessedDocumentRecord
 from app.logging_config import get_logger
 from app.paperless.client import PaperlessClient
 from app.paperless.exceptions import PaperlessError
+
+if TYPE_CHECKING:
+    from app.db.database import Database
 
 logger = get_logger("classifier")
 
@@ -139,11 +144,11 @@ class PipelineConfig:
 class ClassificationPipeline:
     """Orchestriert den gesamten Klassifizierungsablauf.
 
-    Verwendet Dependency Injection: Paperless-Client, Claude-Client
-    und Konfiguration werden von außen übergeben.
+    Verwendet Dependency Injection: Paperless-Client, Claude-Client,
+    Konfiguration und optional eine Datenbank werden von außen übergeben.
 
     Verwendung:
-        pipeline = ClassificationPipeline(paperless, claude, config)
+        pipeline = ClassificationPipeline(paperless, claude, config, database)
         result = await pipeline.classify_document(doc_id)
     """
 
@@ -152,10 +157,12 @@ class ClassificationPipeline:
         paperless: PaperlessClient,
         claude: ClaudeClient,
         config: PipelineConfig | None = None,
+        database: Database | None = None,
     ) -> None:
         self._paperless = paperless
         self._claude = claude
         self._config = config or PipelineConfig()
+        self._db = database
 
         # System-Prompt wird beim ersten Aufruf gebaut und gecacht
         self._system_prompt: str | None = None
@@ -242,7 +249,7 @@ class ClassificationPipeline:
             # Schritt 9: Ergebnis auf Dokument anwenden
             await self._apply_result(document_id, resolved, confidence, doc)
 
-            # Schritt 10: Protokollierung (SQLite kommt in AP-06)
+            # Schritt 10: Protokollierung in SQLite
             result.success = True
             logger.info(
                 "Pipeline abgeschlossen: Dokument %d → %s (%s), %.1fs",
@@ -292,6 +299,10 @@ class ClassificationPipeline:
 
         finally:
             result.duration_seconds = time.monotonic() - start_time
+
+            # Schritt 10: In SQLite persistieren (wenn DB verfügbar und
+            # API-Aufruf stattgefunden hat, d.h. Kostendaten vorhanden)
+            await self._persist_result(result)
 
         return result
 
@@ -618,4 +629,75 @@ class ClassificationPipeline:
             logger.error(
                 "Konnte Tag 'NEU' nicht entfernen für Dokument %d: %s",
                 document_id, exc,
+            )
+
+    async def _persist_result(self, result: PipelineResult) -> None:
+        """Persistiert das Pipeline-Ergebnis in SQLite (Schritt 10).
+
+        Wird im finally-Block aufgerufen – sowohl bei Erfolg als auch
+        bei Fehler.  Voraussetzung: Es muss eine Claude-Antwort vorliegen
+        (d.h. der API-Aufruf war erfolgreich), damit Kostendaten existieren.
+
+        Bei fehlendem DB-Backend (Tests, Degraded-Modus) oder fehlender
+        Klassifizierung wird nichts geschrieben.
+        """
+        if not self._db:
+            return
+
+        # Nur persistieren wenn der API-Aufruf stattfand (Kostendaten vorhanden)
+        if not result.classification:
+            return
+
+        try:
+            usage = result.classification.usage
+            raw_result = result.classification.result
+
+            # Claude-Antwort als JSON serialisieren
+            classification_json = ""
+            if raw_result:
+                try:
+                    classification_json = json.dumps(
+                        raw_result.model_dump(),
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                except Exception:
+                    classification_json = str(raw_result)
+
+            # Status bestimmen
+            if result.error:
+                status = "error"
+            elif result.confidence:
+                status = result.confidence.ki_status
+            else:
+                status = "classified"
+
+            record = ProcessedDocumentRecord(
+                paperless_id=result.document_id,
+                model_used=result.model_used,
+                processing_mode="immediate",
+                classification_json=classification_json,
+                confidence=raw_result.confidence.value if raw_result else "",
+                reasoning=raw_result.reasoning if raw_result else None,
+                status=status,
+                error_message=result.error,
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                cache_read_tokens=usage.cache_read_tokens,
+                cache_creation_tokens=usage.cache_creation_tokens,
+                cost_usd=usage.cost_usd,
+                duration_seconds=result.duration_seconds,
+            )
+
+            row_id = await self._db.insert_processed_document(record)
+            logger.info(
+                "Ergebnis persistiert: Dokument %d → row_id=%d, "
+                "status=%s, cost=$%.6f",
+                result.document_id, row_id, status, usage.cost_usd,
+            )
+        except Exception as exc:
+            # DB-Fehler dürfen die Pipeline nicht zum Absturz bringen
+            logger.error(
+                "Fehler beim Persistieren von Dokument %d: %s",
+                result.document_id, exc,
             )

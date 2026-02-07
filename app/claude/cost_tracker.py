@@ -6,14 +6,24 @@ Cache Read, Cache Write). Akkumuliert Verbrauchsdaten für Daily/Monthly Trackin
 Preistabelle: Stand Anthropic Pricing Page, 06.02.2026.
 Cache Write hat zwei Stufen: 5min (ephemeral) und 1h.
 Bei Preisänderungen von Anthropic hier aktualisieren.
+
+AP-06: CostTracker nutzt optional SQLite als Backend für persistente
+Kostenabfragen.  Die In-Memory-Liste bleibt als Session-Cache bestehen.
+Methoden für Monats-/Tageskosten und Limitprüfung sind async und lesen
+aus der DB (wenn verfügbar), mit Fallback auf In-Memory.
 """
+
+from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from pydantic import BaseModel, Field, model_validator
+
+if TYPE_CHECKING:
+    from app.db.database import Database
 
 logger = logging.getLogger(__name__)
 
@@ -199,15 +209,40 @@ class TokenUsage(BaseModel):
 class CostTracker:
     """Akkumuliert Token-Verbrauch und Kosten über die Laufzeit.
 
-    In-Memory-Tracking.  Persistierung in SQLite erfolgt separat
-    über das State-Management (späteres AP).
+    Hybrides Tracking:
+    - In-Memory-Liste für den aktuellen Session-Überblick (schnell, sync)
+    - SQLite-Datenbank für persistente Kosten über Container-Restarts
+
+    Die async-Methoden (get_monthly_cost, is_limit_reached, etc.) nutzen
+    die Datenbank als primäre Quelle.  Ohne DB-Backend (Tests, Degraded-Modus)
+    fällt der Tracker auf die In-Memory-Liste zurück.
     """
 
     def __init__(self) -> None:
         self._usages: list[TokenUsage] = []
+        self._db: Database | None = None
+
+    def set_database(self, db: Database) -> None:
+        """Setzt das Datenbank-Backend für persistente Abfragen.
+
+        Wird nach DB-Initialisierung in main.py aufgerufen.
+        Kein Pflichtaufruf – ohne DB arbeitet der Tracker rein In-Memory.
+        """
+        self._db = db
+        logger.info("CostTracker: SQLite-Backend aktiviert")
+
+    @property
+    def has_database(self) -> bool:
+        """True wenn ein Datenbank-Backend verfügbar ist."""
+        return self._db is not None
 
     def record(self, usage: TokenUsage) -> None:
-        """Zeichnet einen API-Aufruf auf und loggt den Verbrauch."""
+        """Zeichnet einen API-Aufruf in der In-Memory-Liste auf.
+
+        Synchrone Methode – wird vom ClaudeClient direkt nach dem
+        API-Aufruf aufgerufen.  Die Persistierung in SQLite erfolgt
+        separat über die Pipeline (Schritt 10: insert_processed_document).
+        """
         self._usages.append(usage)
         logger.info(
             "API-Verbrauch aufgezeichnet: model=%s, in=%d, out=%d, "
@@ -221,29 +256,22 @@ class CostTracker:
             usage.document_id,
         )
 
-    # --- Abfragen ---
+    # --- Async-Abfragen (DB-backed) ---
 
-    @property
-    def total_cost_usd(self) -> float:
-        """Gesamtkosten aller aufgezeichneten Aufrufe."""
-        return sum(u.cost_usd for u in self._usages)
-
-    @property
-    def total_requests(self) -> int:
-        """Anzahl aufgezeichneter API-Aufrufe."""
-        return len(self._usages)
-
-    def get_daily_cost(self, day: Optional[date] = None) -> float:
-        """Kosten für einen bestimmten Tag (default: heute)."""
-        target = day or date.today()
-        return sum(u.cost_usd for u in self._usages if u.timestamp.date() == target)
-
-    def get_monthly_cost(
+    async def get_monthly_cost(
         self,
-        year: Optional[int] = None,
-        month: Optional[int] = None,
+        year: int | None = None,
+        month: int | None = None,
     ) -> float:
-        """Kosten für einen bestimmten Monat (default: aktueller Monat)."""
+        """Kosten für einen bestimmten Monat (default: aktueller Monat).
+
+        Liest aus der Datenbank (persistiert über Restarts).
+        Fallback auf In-Memory wenn kein DB-Backend vorhanden.
+        """
+        if self._db:
+            return await self._db.get_monthly_cost(year, month)
+
+        # Fallback: In-Memory
         now = date.today()
         y = year or now.year
         m = month or now.month
@@ -253,7 +281,23 @@ class CostTracker:
             if u.timestamp.year == y and u.timestamp.month == m
         )
 
-    def is_limit_reached(self, limit_usd: float) -> bool:
+    async def get_daily_cost(self, day: date | None = None) -> float:
+        """Kosten für einen bestimmten Tag (default: heute).
+
+        Liest aus der Datenbank.  Fallback auf In-Memory.
+        """
+        if self._db:
+            return await self._db.get_daily_cost(day)
+
+        # Fallback: In-Memory
+        target = day or date.today()
+        return sum(
+            u.cost_usd
+            for u in self._usages
+            if u.timestamp.date() == target
+        )
+
+    async def is_limit_reached(self, limit_usd: float) -> bool:
         """Prüft ob das monatliche Kostenlimit erreicht oder überschritten ist.
 
         Args:
@@ -264,20 +308,33 @@ class CostTracker:
         """
         if limit_usd <= 0:
             return False
-        return self.get_monthly_cost() >= limit_usd
+        monthly = await self.get_monthly_cost()
+        return monthly >= limit_usd
 
-    def get_model_breakdown(self) -> dict[str, dict[str, float | int]]:
-        """Aufschlüsselung nach Modell für den aktuellen Monat.
+    async def get_model_breakdown(
+        self,
+        year: int | None = None,
+        month: int | None = None,
+    ) -> dict[str, dict[str, float | int]]:
+        """Aufschlüsselung nach Modell für einen Monat.
+
+        Liest aus der Datenbank.  Fallback auf In-Memory.
 
         Returns:
-            Dict mit Modell-String als Key und
-            {"cost_usd": float, "requests": int, "total_tokens": int} als Value.
+            Dict mit Modellnamen als Key und
+            {"cost_usd": float, "count": int, ...} als Value.
         """
+        if self._db:
+            return await self._db.get_model_breakdown(year, month)
+
+        # Fallback: In-Memory
         now = date.today()
+        y = year or now.year
+        m = month or now.month
         breakdown: dict[str, dict[str, float | int]] = {}
 
         for u in self._usages:
-            if u.timestamp.year != now.year or u.timestamp.month != now.month:
+            if u.timestamp.year != y or u.timestamp.month != m:
                 continue
             if u.model not in breakdown:
                 breakdown[u.model] = {"cost_usd": 0.0, "requests": 0, "total_tokens": 0}
@@ -287,13 +344,36 @@ class CostTracker:
 
         return breakdown
 
+    # --- Sync-Abfragen (Session-Daten, In-Memory) ---
+
+    @property
+    def session_cost_usd(self) -> float:
+        """Kosten der aktuellen Session (seit Container-Start)."""
+        return sum(u.cost_usd for u in self._usages)
+
+    @property
+    def session_requests(self) -> int:
+        """Anzahl API-Aufrufe in der aktuellen Session."""
+        return len(self._usages)
+
+    # Rückwärtskompatibilität: alte Property-Namen als Aliase
+    @property
+    def total_cost_usd(self) -> float:
+        """Gesamtkosten der Session (Alias für session_cost_usd)."""
+        return self.session_cost_usd
+
+    @property
+    def total_requests(self) -> int:
+        """Anzahl Session-Aufrufe (Alias für session_requests)."""
+        return self.session_requests
+
     @property
     def usages(self) -> list[TokenUsage]:
-        """Alle aufgezeichneten Nutzungsdaten (Kopie der internen Liste)."""
+        """Alle aufgezeichneten Nutzungsdaten der Session (Kopie)."""
         return list(self._usages)
 
     def clear(self) -> None:
-        """Löscht alle aufgezeichneten Daten (z.B. nach Persistierung)."""
+        """Löscht die In-Memory-Daten (z.B. nach Tests)."""
         count = len(self._usages)
         self._usages.clear()
-        logger.debug("CostTracker geleert: %d Einträge entfernt", count)
+        logger.debug("CostTracker Session geleert: %d Einträge entfernt", count)
