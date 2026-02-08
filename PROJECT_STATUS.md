@@ -3,7 +3,7 @@
 Dieses Dokument dient als Chat-übergreifender Kontext für die Entwicklung
 mit Claude. Es wird nach jedem abgeschlossenen Arbeitspaket aktualisiert.
 
-**Letzte Aktualisierung:** 2026-02-07, nach AP-10
+**Letzte Aktualisierung:** 2026-02-08, nach AP-11
 
 ---
 
@@ -13,7 +13,7 @@ mit Claude. Es wird nach jedem abgeschlossenen Arbeitspaket aktualisiert.
 |---|---|
 | Hardware | Raspberry Pi 4 (ARM64) |
 | OS | CasaOS / Debian |
-| Paperless-ngx | v2.20.6, 162 Dokumente, Port 8000 |
+| Paperless-ngx | v2.20.6, 163 Dokumente, Port 8000 |
 | Container | `paperless-classifier`, Port 8501, Python 3.11-slim |
 | Repo | `github.com/swarp22/paperless-classifier` (privat) |
 | Projektpfad Pi | `/DATA/AppData/paperless-classifier` |
@@ -45,6 +45,7 @@ mit Claude. Es wird nach jedem abgeschlossenen Arbeitspaket aktualisiert.
 - Model Router bewusst auf AP-04 verschoben (ERRATA E-006)
 - Preistabelle aktualisiert: Opus 4.5 = $5/$25 statt $15/$75 (ERRATA E-007)
 - Cache Write mit zwei Stufen: 5min (ephemeral) und 1h
+- **AP-11:** `effort`-Parameter für Adaptive Thinking (E-033)
 
 ### AP-04: Classifier Core ✓
 - `app/classifier/model_router.py`: Lokale PDF-Analyse (PyMuPDF), Modellwahl (Sonnet/Haiku)
@@ -118,20 +119,61 @@ mit Claude. Es wird nach jedem abgeschlossenen Arbeitspaket aktualisiert.
   - `_check_schema_trigger()` in `_run_loop()` – nur Logging bis AP-11
   - `main.py` übergibt `database=state.database` an Poller
 
+### AP-11: Schema-Analyse – Opus-Analyse & Prompt-Builder ✓
+- **Analyzer-Modul** (`app/schema_matrix/analyzer.py`):
+  - Opus-API-Aufruf mit `effort="low"` (E-033: Adaptive Thinking)
+  - Pydantic Response-Modelle (OpusAnalysisResponse) mit toleranten Typen (E-034)
+  - JSON-Parsing mit Diagnostik-Logging
+  - Upsert in SQLite: is_manual-Schutz, Mappings ohne Pfad überspringen
+- **Prompt-Builder** (`app/claude/prompts.py`):
+  - Schema-Regeln werden in den Klassifizierungs-System-Prompt eingebettet
+  - Titel-Schemata, Pfad-Regeln, Zuordnungsmatrix als Kontext für Sonnet/Haiku
+  - Cache-Invalidierung nach erfolgreicher Analyse
+- **Poller-Integration:**
+  - Trigger → Collector → Opus → Storage → Audit-Log (vollständige Pipeline)
+- **Erstlauf-Ergebnisse (162 Dokumente):**
+  - 53 Titel-Schemata, 11 Pfad-Regeln, 53 Mappings
+  - Laufzeit: ~131s, Kosten: $0.46
+  - Input: 13.214 Tokens, Output: 15.653 Tokens
+- **Erster Klassifizierungs-Test mit Schema-Regeln:**
+  - VBK Entgeltabrechnung 2025-12: Perfekte Zuordnung (Korrespondent, Typ, Pfad, Titel, Paginierung 540, Person Max)
+  - Schema-Regeln erfolgreich im Prompt integriert
+- **ERRATA:** E-033 (Adaptive Thinking), E-034 (Pydantic-Toleranz)
+- **Offene Punkte → AP-11b:**
+  - Tags fehlen in der Schema-Analyse (Steuer-Tag bei Gehaltsabrechnungen fälschlich vergeben)
+  - Personen-Zuordnung braucht Kontext-Prompt (Kilian = thematischer Filter)
+
 ## Nächstes Arbeitspaket
 
-**AP-11: Schema-Analyse – Opus-Analyse & Prompt-Builder**
-- Opus-API-Aufruf: Analyse-Prompt mit vorverarbeiteten Collector-Daten
-- Response-Parsing: JSON → SQLite (Titel-Schemata, Pfad-Regeln, Matrix)
-- Prompt-Builder: Schema-Regeln in den Klassifizierungs-System-Prompt einbetten
-- Upsert-Logik: Manuelle Einträge (is_manual=TRUE) nicht überschreiben
-- Poller-Integration: Trigger → Collector → Opus → Storage → Audit-Log
+**AP-11b: Schema-Erweiterung – Tag-Muster & Personen-Kontext** (eingeschoben)
+
+Zwei Erweiterungen aus den AP-11 Live-Tests:
+
+1. **Tag-Muster in Schema-Analyse:** Collector erfasst Tag-Distribution pro
+   (Korrespondent, Dokumenttyp)-Gruppe. Opus leitet daraus positive ("vergib Tag X")
+   und negative Regeln ab ("vergib NICHT Tag Y, weil ..."). Konkret: Gehaltsabrechnungen
+   sollen keinen Steuer-Tag bekommen.
+
+2. **Personen-Kontext im Klassifizierungs-Prompt:** "Person" = thematischer Filter
+   ("wen betrifft es?"), nicht Besitzverhältnis. Kontextbasierte Erkennung für Kilian
+   (Schwangerschaft, Kindermöbel, Kinderarzt). Fallback: Adressat des Dokuments.
+
+Betroffene Dateien: `collector.py`, `analyzer.py`, `storage.py`, `database.py`, `prompts.py`
+
+→ Design-Dokument: `11b-schema-tags-personen.md`
 
 **AP-12: Schema-Analyse – Web-UI**
 - Drei Tabs: Titel-Schemata, Pfad-Regeln, Zuordnungsmatrix
 - Bearbeiten/Fixieren einzelner Einträge (is_manual setzen)
 - Manueller Trigger-Button für Schema-Analyse-Lauf
 - Anzeige des letzten Lauf-Ergebnisses (Audit-Log)
+- **Neu:** Tab für Tag-Regeln (aus AP-11b)
+
+**AP-13: Dokumenteverknüpfung**
+- Zusammengehörige Dokumente erkennen und verlinken
+
+**AP-14: NPM-Finalisierung & Batch-API**
+- Batch-Verarbeitung, Performance-Optimierung
 
 ## Konfiguration (config.py – aktuelle Werte)
 
@@ -146,9 +188,33 @@ schema_matrix_threshold = 20
 schema_matrix_min_interval_h = 24
 ```
 
+## Schema-Analyse Baseline (AP-11 Erstlauf)
+
+| Metrik | Wert |
+|---|---|
+| Dokumente analysiert | 162 |
+| Titel-Schemata | 53 |
+| Pfad-Regeln | 11 |
+| Zuordnungsmatrix | 53 |
+| Input-Tokens | 13.214 |
+| Output-Tokens | 15.653 |
+| Kosten | $0.46 |
+| Laufzeit | ~131s |
+| Modell | claude-opus-4-6, effort=low |
+
+**Skalierungsschätzung:**
+
+| Dokumente | Kosten/Lauf (geschätzt) |
+|---|---|
+| 200 | ~$0.48 |
+| 500 | ~$0.68 |
+| 1000 | ~$0.98 |
+
+Bei wöchentlichem Lauf und 1000 Dokumenten: ~$4/Monat.
+
 ## Paperless-Stammdaten (Kurzfassung)
 
-- 29 Korrespondenten, 23 Dokumenttypen, 7 Tags, 30 Speicherpfade
+- 29 Korrespondenten, 24 Dokumenttypen, 7 Tags, 30 Speicherpfade
 - Vollständige Struktur: `paperless-struktur-20260202-184522.json` im Projektwissen
 
 ## Projektdateien-Übersicht
@@ -164,9 +230,9 @@ paperless-classifier/
 │   ├── health.py                  # Health-Check-Logik
 │   ├── claude/                    # AP-03
 │   │   ├── __init__.py
-│   │   ├── client.py
+│   │   ├── client.py             # + effort-Parameter (AP-11)
 │   │   ├── cost_tracker.py
-│   │   └── prompts.py
+│   │   └── prompts.py            # + Schema-Regeln-Integration (AP-11)
 │   ├── db/                        # AP-06 + AP-09 + AP-10
 │   │   ├── __init__.py
 │   │   └── database.py
@@ -182,11 +248,12 @@ paperless-classifier/
 │   │   ├── client.py
 │   │   ├── exceptions.py
 │   │   └── models.py
-│   ├── scheduler/                 # AP-05 + AP-10
+│   ├── scheduler/                 # AP-05 + AP-10 + AP-11
 │   │   ├── __init__.py
 │   │   └── poller.py
-│   ├── schema_matrix/             # AP-10
+│   ├── schema_matrix/             # AP-10 + AP-11
 │   │   ├── __init__.py
+│   │   ├── analyzer.py            # NEU in AP-11
 │   │   ├── collector.py
 │   │   ├── storage.py
 │   │   └── trigger.py
@@ -203,7 +270,7 @@ paperless-classifier/
 ├── requirements.txt
 ├── .env.example
 ├── .gitignore
-├── ERRATA.md                      # E-001 bis E-032
+├── ERRATA.md                      # E-001 bis E-034
 ├── PROJECT_STATUS.md
 └── README.md
 ```

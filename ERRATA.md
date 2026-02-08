@@ -487,7 +487,7 @@ Betroffene Funktionen:
 
 **Ursache:** Kein Fallback-Regelwerk vorhanden. Claude hat keine Zuordnungsregeln wie "Mietwohnung Kaiserstraße 142 → Max" oder "Adressat im Dokument → Person-Feld". Die Personen-Zuordnung stützt sich aktuell nur auf Claudes eigenständige Erkennung ohne gelernten Kontext.
 
-**Lösung (Phase 3):** Schema-Analyse soll Zuordnungsregeln für Personen lernen, analog zu den Speicherpfad-Regeln. Mögliche Quellen: Adressat im Dokument, Korrespondent-Person-Mapping aus historischen Daten, Mietobjekt/Eigentum-Zuordnungen.
+**Lösung (AP-11b):** Personen-Kontext wird als fester Prompt-Abschnitt eingebaut. Zuordnung nach dem Prinzip "wen betrifft es thematisch?" statt Name-Matching. Kilian-bezogene Dokumente (Schwangerschaft, Kindermöbel, Kinderarzt) werden kontextbasiert erkannt. Fallback: Adressat des Dokuments.
 
 ---
 
@@ -550,3 +550,47 @@ Betroffene Funktionen:
 **Problem:** NiceGUI `ui.input` mit `.props("clearable")` sendet `e.value = None` (nicht `""`) beim Klick auf das X-Symbol. `_filter_entries()` rief `.lower()` auf `None` auf → `AttributeError`.
 
 **Lösung:** Handler abgesichert mit `e.value or ""`, Filter-Funktion mit `(current_search["value"] or "").lower().strip()`.
+
+---
+
+## E-033: Schema-Analyse Erstlauf schlägt fehl – Opus 4.6 Token-Budget durch Adaptive Thinking erschöpft (AP-11, 2026-02-08)
+
+**Betrifft:** `app/claude/client.py`, `app/schema_matrix/analyzer.py`
+
+**Problem:** Der erste Schema-Analyse-Lauf (162 Dokumente) schlug nach 92 Sekunden fehl. Opus 4.6 lieferte einen leeren Text-Response, JSON-Parsing ergab `Expecting value: line 1 column 1 (char 0)`.
+
+**Ursache:** Opus 4.6 nutzt standardmäßig "Adaptive Thinking" mit Effort-Level "high". Die Thinking-Tokens werden aus demselben `max_tokens`-Budget (8192) konsumiert. Bei 92 Sekunden Laufzeit hat das Modell intensiv "nachgedacht", so dass für den eigentlichen JSON-Output nichts übrig blieb.
+
+**Lösung:**
+1. **ClaudeClient** (`client.py`): Neuer Parameter `effort: str | None` in `send_message()`. Wird als `output_config={"effort": effort}` an die API übergeben. Steuert Adaptive-Thinking-Verhalten.
+2. **Analyzer** (`analyzer.py`): `_call_opus()` setzt `effort="low"` – strukturierte JSON-Extraktion braucht kein Deep Reasoning.
+3. **Diagnostik**: Block-Typen, `stop_reason`, Thinking-Block-Überspringung, Text-Länge im Log.
+4. **Sicherheitsnetz**: `max_output_tokens` erhöht von 8192 auf 16384.
+
+**Effort-Levels (Opus 4.5/4.6):**
+- `low`: Minimal Thinking, schnell, günstig → für strukturierte Outputs
+- `medium`: Balanciert
+- `high` (Default): Aggressive Thinking-Nutzung
+- `max`: Maximum Reasoning
+
+**Ergebnis:** Laufzeit von 92s (leer) auf ~131s (volles JSON mit 53 Titeln, 11 Pfaden, 53 Mappings). Kosten: $0.46 pro Lauf.
+
+---
+
+## E-034: Opus liefert abweichende Datentypen in Schema-Response (AP-11, 2026-02-08)
+
+**Betrifft:** `app/schema_matrix/analyzer.py`, Pydantic-Modelle
+
+**Problem:** Nach dem Adaptive-Thinking-Fix (E-033) liefert Opus valides JSON, aber mit zwei Typ-Abweichungen gegenüber den Pydantic-Modellen:
+
+1. **`normalization_suggestions`**: Erwartet `list[dict[str, str]]`, geliefert `list[str]` (Opus schreibt Freitext-Vorschläge statt strukturierter Dicts)
+2. **`storage_path_name`**: Erwartet `str` (required), geliefert `None` bei 5 von 53 Mappings (Kombination ohne klaren Speicherpfad)
+
+Pydantic ValidationError mit 8 Fehlern → Schema-Analyse als "error" gespeichert.
+
+**Lösung:**
+1. `normalization_suggestions`: Typ geändert von `list[dict[str, str]]` zu `list[Any]` → akzeptiert beides
+2. `storage_path_name`: Typ geändert von `str` zu `str | None = None` → Null erlaubt
+3. `_store_results()`: Mappings ohne `storage_path_name` werden übersprungen (nicht speicherbar)
+
+**Erkenntnis:** Bei LLM-generierten JSON-Responses sollten Pydantic-Modelle maximal tolerant sein. Strenge Validierung gehört in die Business-Logik nach dem Parsing, nicht ins Datenmodell.
