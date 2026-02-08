@@ -47,6 +47,10 @@ class TitleGroup:
     correspondent: str
     titles: list[str] = field(default_factory=list)
     document_ids: list[int] = field(default_factory=list)
+    # Tag-Muster (AP-11b): Welche Tags kommen wie oft vor?
+    tag_distribution: dict[str, int] = field(default_factory=dict)
+    # Tags die bei >50% der Dokumente in dieser Gruppe vorkommen
+    common_tags: list[str] = field(default_factory=list)
 
     @property
     def count(self) -> int:
@@ -261,6 +265,9 @@ class SchemaCollector:
 
         Dokumente ohne Typ oder ohne Korrespondent werden übersprungen,
         da für sie kein Schema erstellt werden kann.
+
+        AP-11b: Erfasst zusätzlich die Tag-Distribution pro Gruppe
+        (welche Tags kommen wie oft vor).
         """
         groups: dict[tuple[str, str], TitleGroup] = {}
 
@@ -280,6 +287,23 @@ class SchemaCollector:
                 )
             groups[key].titles.append(doc.title)
             groups[key].document_ids.append(doc.id)
+
+            # Tag-Distribution: Alle Tags des Dokuments zählen (AP-11b)
+            for tag_id in doc.tags:
+                tag_name = self._resolve_tag_name(tag_id)
+                if tag_name and tag_name != "NEU":
+                    groups[key].tag_distribution[tag_name] = (
+                        groups[key].tag_distribution.get(tag_name, 0) + 1
+                    )
+
+        # Common Tags berechnen: Tags die bei >50% der Gruppengröße vorkommen
+        for group in groups.values():
+            threshold = group.count / 2
+            group.common_tags = sorted(
+                tag_name
+                for tag_name, count in group.tag_distribution.items()
+                if count > threshold
+            )
 
         # Sortiert zurückgeben: größte Gruppen zuerst (für Opus-Priorisierung)
         result = sorted(groups.values(), key=lambda g: g.count, reverse=True)
@@ -471,12 +495,17 @@ class SchemaCollector:
         # Ebene 1: Titel-Gruppen
         title_groups_data = []
         for group in result.title_groups:
-            title_groups_data.append({
+            group_data: dict[str, Any] = {
                 "document_type": group.document_type,
                 "correspondent": group.correspondent,
                 "count": group.count,
                 "titles": group.titles,
-            })
+            }
+            # Tag-Muster nur einfügen wenn vorhanden (AP-11b)
+            if group.tag_distribution:
+                group_data["common_tags"] = group.common_tags
+                group_data["tag_distribution"] = group.tag_distribution
+            title_groups_data.append(group_data)
 
         # Ebene 2: Pfad-Hierarchie
         paths_data = []
@@ -555,4 +584,9 @@ class SchemaCollector:
         if path_id is None:
             return None
         obj = self._cache.get_storage_path(path_id)
+        return obj.name if obj else None
+
+    def _resolve_tag_name(self, tag_id: int) -> str | None:
+        """Löst eine Tag-ID in den Namen auf."""
+        obj = self._cache.get_tag(tag_id)
         return obj.name if obj else None

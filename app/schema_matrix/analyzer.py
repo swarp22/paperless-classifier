@@ -34,6 +34,7 @@ from app.schema_matrix.storage import (
     MappingEntry,
     PathRule,
     SchemaStorage,
+    TagRule,
     TitlePattern,
 )
 
@@ -90,12 +91,24 @@ class OpusSuggestion(BaseModel):
     priority: str = "medium"
 
 
+class OpusTagRuleItem(BaseModel):
+    """Eine Tag-Zuordnungsregel aus der Opus-Antwort (AP-11b)."""
+
+    correspondent: str | None = None      # None/leer = gilt für alle
+    document_type: str
+    positive_tags: list[str] = Field(default_factory=list)
+    negative_tags: list[str] = Field(default_factory=list)
+    reasoning: str = ""
+    confidence: float = 0.5
+
+
 class OpusAnalysisResponse(BaseModel):
     """Vollständige validierte Opus-Antwort."""
 
     title_schemas: list[OpusTitleSchema] = Field(default_factory=list)
     path_rules: list[OpusPathRule] = Field(default_factory=list)
     mapping_matrix: list[OpusMappingEntry] = Field(default_factory=list)
+    tag_rules: list[OpusTagRuleItem] = Field(default_factory=list)
     suggestions: list[OpusSuggestion] = Field(default_factory=list)
 
 
@@ -105,11 +118,11 @@ class OpusAnalysisResponse(BaseModel):
 
 _SCHEMA_ANALYSIS_SYSTEM_PROMPT = """\
 Du analysierst die vollständige Organisationsstruktur eines Paperless-ngx \
-Dokumentenarchivs. Deine Aufgabe hat drei Teile.
+Dokumentenarchivs. Deine Aufgabe hat vier Teile.
 
 Antworte ausschließlich mit validem JSON. Kein Markdown, kein erklärender Text.
 Verwende exakt die Schlüssel "title_schemas", "path_rules", \
-"mapping_matrix", "suggestions"."""
+"mapping_matrix", "tag_rules", "suggestions"."""
 
 _SCHEMA_ANALYSIS_USER_TEMPLATE = """\
 ## Teil 1: Titel-Schemata
@@ -160,8 +173,27 @@ Für jede Kombination:
 
 {changes_section}
 
+## Teil 4: Tag-Zuordnungsregeln
+
+Die Titel-Gruppen enthalten jetzt auch Tag-Informationen (common_tags, \
+tag_distribution). Analysiere die Tag-Vergabe pro Dokumenttyp-Korrespondent-\
+Kombination:
+
+1. Welche Tags werden konsistent vergeben (bei >80% der Dokumente)?
+2. Welche Tags fehlen BEWUSST – d.h. ein Tag liegt inhaltlich nahe, wird \
+aber bei dieser Kombination nie oder fast nie vergeben? Beispiel: \
+"Steuer {{Jahr}}" bei Gehaltsabrechnungen, wenn eine elektronische \
+Lohnsteuerbescheinigung das Einzeltagging überflüssig macht.
+3. Formuliere positive Regeln ("Typ X bekommt immer Tag Y") und negative \
+Regeln ("Typ X bekommt NICHT Tag Y, weil ...").
+4. Wenn ein Korrespondent für die Regel irrelevant ist (Regel gilt \
+dokumenttyp-weit), setze correspondent auf null.
+
+Erstelle nur Regeln mit hoher Aussagekraft (≥5 Dokumente in der Gruppe). \
+Keine Regeln für Gruppen mit <5 Dokumenten.
+
 Antwortformat: JSON mit den Schlüsseln "title_schemas", "path_rules", \
-"mapping_matrix", "suggestions".
+"mapping_matrix", "tag_rules", "suggestions".
 
 Jedes Element in "title_schemas" hat: document_type, correspondent, \
 title_template, rule_description, confidence, document_count, \
@@ -174,7 +206,11 @@ Jedes Element in "mapping_matrix" hat: correspondent, document_type, \
 storage_path_name, mapping_type, condition_description, document_count, \
 confidence.
 
-Jedes Element in "suggestions" hat: category (title/path/mapping/general), \
+Jedes Element in "tag_rules" hat: correspondent (string oder null), \
+document_type, positive_tags (Liste), negative_tags (Liste), \
+reasoning (Begründung), confidence (0.0-1.0).
+
+Jedes Element in "suggestions" hat: category (title/path/mapping/tags/general), \
 description, priority (high/medium/low)."""
 
 
@@ -269,11 +305,12 @@ class SchemaAnalyzer:
             logger.info(
                 "Schema-Analyse abgeschlossen: %.1fs, $%.4f, "
                 "%d Titel-Schemata, %d Pfad-Regeln, %d Mappings, "
-                "%d Vorschläge",
+                "%d Tag-Regeln, %d Vorschläge",
                 duration, run_record.cost_usd,
                 run_record.title_schemas_created + run_record.title_schemas_updated,
                 run_record.path_rules_created + run_record.path_rules_updated,
                 run_record.mappings_created + run_record.mappings_updated,
+                run_record.tag_rules_created + run_record.tag_rules_updated,
                 run_record.suggestions_count,
             )
 
@@ -514,10 +551,11 @@ class SchemaAnalyzer:
 
         logger.info(
             "Opus-Antwort geparst: %d Titel-Schemata, %d Pfad-Regeln, "
-            "%d Mappings, %d Vorschläge",
+            "%d Mappings, %d Tag-Regeln, %d Vorschläge",
             len(parsed.title_schemas),
             len(parsed.path_rules),
             len(parsed.mapping_matrix),
+            len(parsed.tag_rules),
             len(parsed.suggestions),
         )
 
@@ -607,11 +645,46 @@ class SchemaAnalyzer:
             elif action == "preserved":
                 run_record.manual_entries_preserved += 1
 
+        # --- Tag-Regeln (AP-11b) ---
+        for tag_data in parsed.tag_rules:
+            # Korrespondent normalisieren: None/leer → '' (DB-Sentinel)
+            correspondent = (tag_data.correspondent or "").strip()
+
+            # Regeln ohne Dokumenttyp sind nicht sinnvoll → überspringen
+            if not tag_data.document_type:
+                logger.debug(
+                    "Tag-Regel übersprungen (kein Dokumenttyp): %s",
+                    tag_data,
+                )
+                continue
+
+            # Regeln ohne positive UND ohne negative Tags sind leer → überspringen
+            if not tag_data.positive_tags and not tag_data.negative_tags:
+                continue
+
+            tag_rule = TagRule(
+                document_type=tag_data.document_type,
+                correspondent=correspondent,
+                positive_tags=tag_data.positive_tags,
+                negative_tags=tag_data.negative_tags,
+                reasoning=tag_data.reasoning,
+                confidence=tag_data.confidence,
+            )
+            action, _ = await self._storage.upsert_tag_rule(tag_rule)
+
+            if action == "created":
+                run_record.tag_rules_created += 1
+            elif action == "updated":
+                run_record.tag_rules_updated += 1
+            elif action == "preserved":
+                run_record.manual_entries_preserved += 1
+
         logger.info(
             "Ergebnisse gespeichert: "
             "Titel %d neu/%d aktualisiert, "
             "Pfade %d neu/%d aktualisiert, "
             "Mappings %d neu/%d aktualisiert, "
+            "Tag-Regeln %d neu/%d aktualisiert, "
             "%d manuelle beibehalten",
             run_record.title_schemas_created,
             run_record.title_schemas_updated,
@@ -619,5 +692,7 @@ class SchemaAnalyzer:
             run_record.path_rules_updated,
             run_record.mappings_created,
             run_record.mappings_updated,
+            run_record.tag_rules_created,
+            run_record.tag_rules_updated,
             run_record.manual_entries_preserved,
         )

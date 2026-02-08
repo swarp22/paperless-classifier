@@ -60,25 +60,32 @@ class PromptData:
 # ---------------------------------------------------------------------------
 
 DEFAULT_PERSON_RULES = """\
-Ordne jedes Dokument einer Person zu, wenn möglich.
+Das Feld "Person" ist ein thematischer Filter: "Wen betrifft dieses Dokument
+primär?" Alle Dokumente gehören der Familie – Person dient zum Filtern nach
+Lebensbereichen, nicht zum Festlegen von Besitzverhältnissen.
 
-Erkennungsreihenfolge:
-1. Direkte Namensnennung (Anrede, Adressat, Patient)
-   - "Herr Obenaus", "Maximilian" → Max
-   - "Frau Obenaus", "Melanie" → Melanie
-   - "Kilian" → Kilian
+Personen:
+- Max: Dokumente die Max persönlich betreffen (Gehalt, eigene Arztrechnung,
+  Steuerbescheid, Versicherung auf seinen Namen)
+- Melanie: Dokumente die Melanie persönlich betreffen (ihre Arztrechnung
+  nicht-schwangerschaftsbezogen, ihre Versicherung, ihre Korrespondenz)
+- Kilian (Sohn, geb. voraussichtlich 2026): Dokumente die das Kind betreffen –
+  Schwangerschaftsvorsorge, Geburtsvorbereitung, Kinderarzt, Kindermöbel,
+  Elterngeld, Kindergeld, U-Untersuchungen. Das Kind "existiert" seit Zeugung.
 
-2. Kontextbasierte Ableitung:
-   - Gehaltsabrechnungen VBK/AVG → Max
-   - Kinderarzt, U-Untersuchungen, Pädiatrie → Kilian
-   - Schwangerschaft, Geburt, Baby, Säugling → Kilian
-   - Gynäkologie, Frauenheilkunde → Melanie
-   - Mutterschaftsgeld, Mutterschutz → Melanie
-   - Elterngeld, Kindergeld → Kilian
-
-3. Fallback:
-   - Gemeinsame Dokumente (Haus, Versorger) → null
-   - Keine Zuordnung möglich → null"""
+Zuordnungsregeln (Priorität von oben nach unten):
+1. Kontext vor Adressat: Hebammenkurs adressiert an Melanie → Kilian
+   (betrifft das Kind)
+2. Möbelkauf "Kinderbett"/"Wickelkommode" → Kilian
+3. Arztrechnung "Schwangerschaftsvorsorge" → Kilian
+4. Arztrechnung "Blutuntersuchung" ohne Schwangerschaftsbezug → Adressat
+5. Gehaltsabrechnungen VBK/AVG → Max
+6. Kinderarzt, U-Untersuchungen, Pädiatrie → Kilian
+7. Gynäkologie, Frauenheilkunde (ohne Schwangerschaftsbezug) → Melanie
+8. Mutterschaftsgeld, Mutterschutz → Melanie
+9. Elterngeld, Kindergeld → Kilian
+10. Fallback: Wenn nicht klar zuordenbar → Adressat des Dokuments
+11. Gemeinsame Dokumente (Haus, Versorger) → null"""
 
 DEFAULT_HOUSE_RULES = """\
 Prüfe ob das Dokument in den Haus-Ordner gehört (physischer Aktenordner).
@@ -319,6 +326,9 @@ async def build_schema_rules_text(database: "Database") -> str | None:
     zu befüllen.  Der formatierte Text wird dann im System-Prompt unter
     "Erkannte Muster (Schema-Analyse)" eingefügt.
 
+    AP-11b: Zusätzlich werden Tag-Zuordnungsregeln als vierte Sektion
+    eingebunden.
+
     Args:
         database: Initialisierte Database-Instanz.
 
@@ -333,9 +343,10 @@ async def build_schema_rules_text(database: "Database") -> str | None:
     title_patterns = await storage.get_all_title_patterns()
     path_rules = await storage.get_all_path_rules()
     mappings = await storage.get_all_mappings()
+    tag_rules = await storage.get_all_tag_rules()
 
     # Keine Daten → kein Regelblock
-    if not title_patterns and not path_rules and not mappings:
+    if not title_patterns and not path_rules and not mappings and not tag_rules:
         return None
 
     sections: list[str] = []
@@ -397,12 +408,32 @@ async def build_schema_rules_text(database: "Database") -> str | None:
                     )
         sections.append("\n".join(lines))
 
+    # --- Sektion 4: Tag-Zuordnungsregeln (AP-11b) ---
+    if tag_rules:
+        lines = ["### Tag-Zuordnungsregeln (gelernt aus dem Dokumentenbestand)\n"]
+        for tr in tag_rules:
+            # Kopfzeile: Korrespondent + Dokumenttyp
+            corr_label = tr.correspondent if tr.correspondent else "(alle Korrespondenten)"
+            lines.append(f"Für {corr_label} + {tr.document_type}:")
+
+            if tr.positive_tags:
+                tags_str = ", ".join(f"\"{t}\"" for t in tr.positive_tags)
+                lines.append(f"  ✔ Vergib: {tags_str}")
+            if tr.negative_tags:
+                tags_str = ", ".join(f"\"{t}\"" for t in tr.negative_tags)
+                lines.append(f"  ✗ Vergib NICHT: {tags_str}")
+            if tr.reasoning:
+                lines.append(f"  Begründung: {tr.reasoning}")
+            lines.append("")  # Leerzeile zwischen Regeln
+        sections.append("\n".join(lines).rstrip())
+
     result = "\n\n".join(sections)
 
     logger.debug(
         "Schema-Regeln formatiert: %d Zeichen, %d Titel-Schemata, "
-        "%d Pfad-Regeln, %d Mappings",
-        len(result), len(title_patterns), len(path_rules), len(mappings),
+        "%d Pfad-Regeln, %d Mappings, %d Tag-Regeln",
+        len(result), len(title_patterns), len(path_rules),
+        len(mappings), len(tag_rules),
     )
 
     return result

@@ -90,6 +90,31 @@ class MappingEntry:
 
 
 @dataclass
+class TagRule:
+    """Eine Tag-Zuordnungsregel pro (Korrespondent, Dokumenttyp)-Kombination.
+
+    AP-11b: Speichert positive ("vergib immer") und negative ("vergib nie")
+    Tag-Regeln, die Opus aus der Tag-Distribution abgeleitet hat.
+
+    correspondent == '' bedeutet "gilt für alle Korrespondenten".
+    """
+
+    document_type: str
+    correspondent: str = ""              # '' = gilt für alle
+    positive_tags: list[str] = field(default_factory=list)
+    negative_tags: list[str] = field(default_factory=list)
+    reasoning: str = ""
+    confidence: float = 0.5
+    is_manual: bool = False
+    source: str = "opus"
+
+    # Nur bei Lesen aus DB gefüllt
+    id: int | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+@dataclass
 class AnalysisRunRecord:
     """Datensatz für einen Schema-Analyse-Lauf (Audit-Log)."""
 
@@ -103,6 +128,8 @@ class AnalysisRunRecord:
     path_rules_updated: int = 0
     mappings_created: int = 0
     mappings_updated: int = 0
+    tag_rules_created: int = 0           # AP-11b
+    tag_rules_updated: int = 0           # AP-11b
     manual_entries_preserved: int = 0
     suggestions_count: int = 0
     suggestions_json: str | None = None
@@ -565,6 +592,159 @@ class SchemaStorage:
         )
 
     # =========================================================================
+    # Tag-Regeln (AP-11b)
+    # =========================================================================
+
+    async def upsert_tag_rule(
+        self,
+        rule: TagRule,
+        *,
+        force: bool = False,
+    ) -> tuple[str, int]:
+        """Tag-Regel einfügen oder aktualisieren.
+
+        Gleiche is_manual-Logik wie bei Titel-Schemata:
+        Manuelle Einträge werden nur bei force=True überschrieben.
+
+        Args:
+            rule: Die Tag-Regel.
+            force: Wenn True, überschreibt auch manuelle Einträge.
+
+        Returns:
+            Tuple (action, row_id).
+        """
+        conn = self._conn
+
+        # Prüfen ob Eintrag bereits existiert (für korrekte action-Erkennung
+        # und is_manual-Schutz)
+        cursor = await conn.execute(
+            """
+            SELECT id, is_manual FROM schema_tag_rules
+            WHERE correspondent = ? AND document_type = ?
+            """,
+            (rule.correspondent, rule.document_type),
+        )
+        existing = await cursor.fetchone()
+
+        # Manuelle Einträge schützen
+        if existing and existing["is_manual"] and not force:
+            logger.debug(
+                "Manuelle Tag-Regel beibehalten: '%s' + %s",
+                rule.correspondent or "(alle)", rule.document_type,
+            )
+            return ("preserved", int(existing["id"]))
+
+        cursor = await conn.execute(
+            """
+            INSERT INTO schema_tag_rules (
+                correspondent, document_type, positive_tags, negative_tags,
+                reasoning, confidence, is_manual, source, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(correspondent, document_type) DO UPDATE SET
+                positive_tags = excluded.positive_tags,
+                negative_tags = excluded.negative_tags,
+                reasoning = excluded.reasoning,
+                confidence = excluded.confidence,
+                source = excluded.source,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                rule.correspondent,
+                rule.document_type,
+                json.dumps(rule.positive_tags, ensure_ascii=False),
+                json.dumps(rule.negative_tags, ensure_ascii=False),
+                rule.reasoning,
+                rule.confidence,
+                rule.is_manual,
+                rule.source,
+            ),
+        )
+        await conn.commit()
+
+        # Action basierend auf Existenz-Check (nicht rowcount, da SQLite
+        # ON CONFLICT DO UPDATE immer rowcount=1 liefert)
+        action = "updated" if existing else "created"
+
+        # Row-ID bestimmen
+        row_id = cursor.lastrowid or 0
+        if row_id == 0 or existing:
+            id_cursor = await conn.execute(
+                """
+                SELECT id FROM schema_tag_rules
+                WHERE correspondent = ? AND document_type = ?
+                """,
+                (rule.correspondent, rule.document_type),
+            )
+            id_row = await id_cursor.fetchone()
+            row_id = int(id_row["id"]) if id_row else 0
+
+        logger.debug(
+            "Tag-Regel %s: '%s' + %s (id=%d)",
+            action, rule.correspondent or "(alle)",
+            rule.document_type, row_id,
+        )
+        return (action, row_id)
+
+    async def get_all_tag_rules(self) -> list[TagRule]:
+        """Alle Tag-Regeln laden, sortiert nach Dokumenttyp + Korrespondent."""
+        cursor = await self._conn.execute(
+            """
+            SELECT * FROM schema_tag_rules
+            ORDER BY document_type, correspondent
+            """,
+        )
+        rows = await cursor.fetchall()
+        return [self._row_to_tag_rule(row) for row in rows]
+
+    async def get_tag_rules_for_type(
+        self,
+        document_type: str,
+        correspondent: str = "",
+    ) -> list[TagRule]:
+        """Tag-Regeln für einen Dokumenttyp laden.
+
+        Liefert sowohl allgemeine Regeln (correspondent='') als auch
+        korrespondent-spezifische Regeln.
+        """
+        cursor = await self._conn.execute(
+            """
+            SELECT * FROM schema_tag_rules
+            WHERE document_type = ?
+              AND (correspondent = '' OR correspondent = ?)
+            ORDER BY correspondent DESC
+            """,
+            (document_type, correspondent),
+        )
+        rows = await cursor.fetchall()
+        return [self._row_to_tag_rule(row) for row in rows]
+
+    async def delete_tag_rule(self, rule_id: int) -> bool:
+        """Tag-Regel löschen."""
+        cursor = await self._conn.execute(
+            "DELETE FROM schema_tag_rules WHERE id = ?",
+            (rule_id,),
+        )
+        await self._conn.commit()
+        return cursor.rowcount > 0
+
+    @staticmethod
+    def _row_to_tag_rule(row: aiosqlite.Row) -> TagRule:
+        """Konvertiert eine DB-Zeile in ein TagRule-Objekt."""
+        return TagRule(
+            id=row["id"],
+            correspondent=row["correspondent"],
+            document_type=row["document_type"],
+            positive_tags=_parse_json_list(row["positive_tags"]),
+            negative_tags=_parse_json_list(row["negative_tags"]),
+            reasoning=row["reasoning"],
+            confidence=float(row["confidence"]),
+            is_manual=bool(row["is_manual"]),
+            source=row["source"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    # =========================================================================
     # Analyse-Läufe (Audit-Log)
     # =========================================================================
 
@@ -583,6 +763,7 @@ class SchemaStorage:
                 title_schemas_unchanged,
                 path_rules_created, path_rules_updated,
                 mappings_created, mappings_updated,
+                tag_rules_created, tag_rules_updated,
                 manual_entries_preserved, suggestions_count,
                 suggestions_json,
                 input_tokens, output_tokens, cost_usd, model_used,
@@ -590,6 +771,7 @@ class SchemaStorage:
             ) VALUES (
                 ?, ?, ?,
                 ?, ?, ?,
+                ?, ?,
                 ?, ?,
                 ?, ?,
                 ?, ?,
@@ -609,6 +791,8 @@ class SchemaStorage:
                 run.path_rules_updated,
                 run.mappings_created,
                 run.mappings_updated,
+                run.tag_rules_created,
+                run.tag_rules_updated,
                 run.manual_entries_preserved,
                 run.suggestions_count,
                 run.suggestions_json,
@@ -691,6 +875,15 @@ class SchemaStorage:
         stats["mappings_manual"] = int(row["manual"] or 0) if row else 0
 
         cursor = await conn.execute(
+            "SELECT COUNT(*) as total, "
+            "SUM(CASE WHEN is_manual THEN 1 ELSE 0 END) as manual "
+            "FROM schema_tag_rules",
+        )
+        row = await cursor.fetchone()
+        stats["tag_rules_total"] = int(row["total"]) if row else 0
+        stats["tag_rules_manual"] = int(row["manual"] or 0) if row else 0
+
+        cursor = await conn.execute(
             "SELECT COUNT(*) FROM schema_analysis_runs",
         )
         row = await cursor.fetchone()
@@ -707,7 +900,8 @@ class SchemaStorage:
         """Setzt/entfernt das is_manual-Flag für einen Eintrag.
 
         Args:
-            table: Tabellenname ('title_patterns', 'path_rules', 'mappings').
+            table: Tabellenname ('title_patterns', 'path_rules', 'mappings',
+                   'tag_rules').
             entry_id: Primärschlüssel.
             is_manual: Neuer Wert.
 
@@ -721,6 +915,7 @@ class SchemaStorage:
             "title_patterns": "schema_title_patterns",
             "path_rules": "schema_path_rules",
             "mappings": "schema_mapping_matrix",
+            "tag_rules": "schema_tag_rules",
         }
         real_table = table_map.get(table)
         if real_table is None:

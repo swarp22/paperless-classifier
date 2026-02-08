@@ -218,6 +218,24 @@ CREATE TABLE IF NOT EXISTS schema_mapping_matrix (
 );
 """
 
+_SCHEMA_TAG_RULES = """
+CREATE TABLE IF NOT EXISTS schema_tag_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    correspondent TEXT NOT NULL DEFAULT '',
+    document_type TEXT NOT NULL,
+    positive_tags TEXT NOT NULL DEFAULT '[]',
+    negative_tags TEXT NOT NULL DEFAULT '[]',
+    reasoning TEXT NOT NULL DEFAULT '',
+    confidence REAL NOT NULL DEFAULT 0.5,
+    is_manual BOOLEAN NOT NULL DEFAULT FALSE,
+    source TEXT NOT NULL DEFAULT 'opus',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    UNIQUE(correspondent, document_type)
+);
+"""
+
 _SCHEMA_ANALYSIS_RUNS = """
 CREATE TABLE IF NOT EXISTS schema_analysis_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -235,6 +253,9 @@ CREATE TABLE IF NOT EXISTS schema_analysis_runs (
     -- Zuordnungsmatrix
     mappings_created INTEGER DEFAULT 0,
     mappings_updated INTEGER DEFAULT 0,
+    -- Tag-Regeln (AP-11b)
+    tag_rules_created INTEGER DEFAULT 0,
+    tag_rules_updated INTEGER DEFAULT 0,
     -- Allgemein
     manual_entries_preserved INTEGER DEFAULT 0,
     suggestions_count INTEGER DEFAULT 0,
@@ -271,6 +292,9 @@ _INDEXES = [
 
     "CREATE INDEX IF NOT EXISTS idx_smm_correspondent "
     "ON schema_mapping_matrix(correspondent);",
+
+    "CREATE INDEX IF NOT EXISTS idx_str_doctype "
+    "ON schema_tag_rules(document_type);",
 
     "CREATE INDEX IF NOT EXISTS idx_sar_run_at "
     "ON schema_analysis_runs(run_at DESC);",
@@ -371,6 +395,7 @@ class Database:
         await conn.execute(_SCHEMA_TITLE_PATTERNS)
         await conn.execute(_SCHEMA_PATH_RULES)
         await conn.execute(_SCHEMA_MAPPING_MATRIX)
+        await conn.execute(_SCHEMA_TAG_RULES)
         await conn.execute(_SCHEMA_ANALYSIS_RUNS)
 
         for idx_sql in _INDEXES:
@@ -393,6 +418,27 @@ class Database:
 
         await conn.commit()
         logger.debug("Schema-Migration abgeschlossen")
+
+        # AP-11b: Nachträgliche Spalten in schema_analysis_runs (idempotent)
+        sar_cols: set[str] = set()
+        cursor = await conn.execute("PRAGMA table_info(schema_analysis_runs)")
+        for row in await cursor.fetchall():
+            sar_cols.add(row[1])
+
+        sar_migrations = [
+            "ALTER TABLE schema_analysis_runs ADD COLUMN tag_rules_created INTEGER DEFAULT 0",
+            "ALTER TABLE schema_analysis_runs ADD COLUMN tag_rules_updated INTEGER DEFAULT 0",
+        ]
+        for alter_sql in sar_migrations:
+            col_name = alter_sql.split("ADD COLUMN ", 1)[1].split()[0]
+            if col_name not in sar_cols:
+                await conn.execute(alter_sql)
+                logger.info(
+                    "Migration: Spalte '%s' zu schema_analysis_runs hinzugefügt",
+                    col_name,
+                )
+
+        await conn.commit()
 
     # --- Verarbeitungshistorie ---
 
