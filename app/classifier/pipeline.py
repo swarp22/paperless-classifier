@@ -51,7 +51,7 @@ from app.claude.client import (
     ClaudeError,
     ConfidenceLevel,
 )
-from app.claude.prompts import PromptData, build_system_prompt
+from app.claude.prompts import PromptData, build_schema_rules_text, build_system_prompt
 from app.db.database import ProcessedDocumentRecord
 from app.logging_config import get_logger
 from app.paperless.client import PaperlessClient
@@ -342,6 +342,24 @@ class ClassificationPipeline:
             person_options=cache.get_select_option_labels(CF_PERSON),
             house_register_options=cache.get_select_option_labels(CF_HAUS_REGISTER),
         )
+
+        # Schema-Analyse-Regeln aus SQLite laden (AP-11)
+        if self._db:
+            try:
+                schema_rules = await build_schema_rules_text(self._db)
+                if schema_rules:
+                    data.schema_analysis_rules = schema_rules
+                    logger.info(
+                        "Schema-Regeln in Prompt integriert: %d Zeichen",
+                        len(schema_rules),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Schema-Regeln konnten nicht geladen werden: %s – "
+                    "Prompt wird ohne Schema-Regeln gebaut",
+                    exc,
+                )
+
         self._prompt_data = data
         self._system_prompt = build_system_prompt(data)
 

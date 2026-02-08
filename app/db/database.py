@@ -532,7 +532,11 @@ class Database:
         year: int | None = None,
         month: int | None = None,
     ) -> float:
-        """Gesamtkosten eines Monats aus daily_costs.
+        """Gesamtkosten eines Monats aus daily_costs + schema_analysis_runs.
+
+        Aggregiert sowohl die Pipeline-Klassifizierungskosten (daily_costs)
+        als auch die Schema-Analyse-Kosten (schema_analysis_runs), damit
+        das Kostenlimit korrekt greift.
 
         Args:
             year: Jahr (default: aktuelles Jahr).
@@ -545,17 +549,30 @@ class Database:
         y = year or now.year
         m = month or now.month
 
-        # YYYY-MM-Präfix für LIKE-Abfrage auf das date-Feld
-        prefix = f"{y:04d}-{m:02d}-%"
-
         conn = self.connection
+
+        # 1. Pipeline-Kosten aus daily_costs
+        prefix = f"{y:04d}-{m:02d}-%"
         cursor = await conn.execute(
             "SELECT COALESCE(SUM(total_cost_usd), 0.0) FROM daily_costs "
             "WHERE date LIKE ?",
             (prefix,),
         )
         row = await cursor.fetchone()
-        return float(row[0]) if row else 0.0
+        pipeline_cost = float(row[0]) if row else 0.0
+
+        # 2. Schema-Analyse-Kosten aus schema_analysis_runs (AP-11)
+        month_start = f"{y:04d}-{m:02d}-01T00:00:00"
+        month_end = f"{y:04d}-{m + 1:02d}-01T00:00:00" if m < 12 else f"{y + 1:04d}-01-01T00:00:00"
+        cursor = await conn.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0.0) FROM schema_analysis_runs "
+            "WHERE run_at >= ? AND run_at < ?",
+            (month_start, month_end),
+        )
+        row = await cursor.fetchone()
+        schema_cost = float(row[0]) if row else 0.0
+
+        return pipeline_cost + schema_cost
 
     async def get_daily_cost(self, day: date | None = None) -> float:
         """Kosten eines einzelnen Tages.
@@ -1058,6 +1075,27 @@ class Database:
             """
             SELECT * FROM schema_analysis_runs
             WHERE status = 'completed'
+            ORDER BY run_at DESC
+            LIMIT 1
+            """,
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def get_last_schema_analysis_attempt(self) -> dict[str, Any] | None:
+        """Gibt den letzten Schema-Analyse-Versuch zurück, unabhängig vom Status.
+
+        Wird für den Fehler-Cooldown benötigt: Nach einem fehlgeschlagenen
+        Lauf soll der Trigger nicht sofort erneut feuern, sondern den
+        Mindestabstand einhalten.  (AP-11, Entscheidung 3)
+
+        Returns:
+            Dict mit allen Feldern oder None wenn noch nie versucht.
+        """
+        conn = self.connection
+        cursor = await conn.execute(
+            """
+            SELECT * FROM schema_analysis_runs
             ORDER BY run_at DESC
             LIMIT 1
             """,

@@ -466,9 +466,11 @@ class Poller:
     async def _check_schema_trigger(self) -> None:
         """Prüft ob die Schema-Analyse ausgelöst werden soll.
 
-        In AP-10 wird nur geloggt – die eigentliche Analyse (Collector +
-        Opus-Aufruf) wird in AP-11 implementiert.  Fehler hier dürfen
-        den Polling-Loop nicht unterbrechen.
+        Bei Auslösung: SchemaAnalyzer erstellen und Analyse-Lauf starten.
+        Nach erfolgreichem Lauf wird der Pipeline-Prompt-Cache invalidiert,
+        damit die nächste Klassifizierung die neuen Schema-Regeln sieht.
+
+        Fehler hier dürfen den Polling-Loop nicht unterbrechen.
         """
         if self._schema_trigger is None:
             return
@@ -477,15 +479,8 @@ class Poller:
             should_run, reason = await self._schema_trigger.should_run()
 
             if should_run:
-                logger.info(
-                    "Schema-Trigger ausgelöst: %s – "
-                    "Analyse noch nicht implementiert (→ AP-11)",
-                    reason,
-                )
-                # TODO AP-11: Hier Collector + Opus-Analyse starten
-                #   collector = SchemaCollector(self._paperless, cache)
-                #   result = await collector.collect(...)
-                #   ... Opus-Analyse + Storage ...
+                logger.info("Schema-Trigger ausgelöst: %s", reason)
+                await self._run_schema_analysis(trigger_reason=reason)
             else:
                 logger.debug("Schema-Trigger: %s", reason)
 
@@ -493,6 +488,70 @@ class Poller:
             # Schema-Trigger-Fehler darf Poller nie stoppen
             logger.warning(
                 "Schema-Trigger-Prüfung fehlgeschlagen: %s",
+                exc,
+                exc_info=True,
+            )
+
+    async def _run_schema_analysis(self, trigger_reason: str) -> None:
+        """Führt die Schema-Analyse aus (AP-11).
+
+        Erstellt den SchemaAnalyzer mit den aktuellen Clients und startet
+        den Analyse-Lauf.  Bei Erfolg wird der Prompt-Cache invalidiert.
+
+        Args:
+            trigger_reason: Menschenlesbare Begründung vom Trigger.
+        """
+        import app.state as state
+        from app.schema_matrix.analyzer import SchemaAnalyzer
+
+        # Voraussetzungen prüfen
+        if state.claude_client is None:
+            logger.warning("Schema-Analyse übersprungen: ClaudeClient nicht verfügbar")
+            return
+        if self._database is None:
+            logger.warning("Schema-Analyse übersprungen: Datenbank nicht verfügbar")
+            return
+
+        # Trigger-Typ aus der Begründung ableiten
+        trigger_type = "schedule"
+        if "Schwellwert" in trigger_reason:
+            trigger_type = "threshold"
+        elif "Erstlauf" in trigger_reason:
+            trigger_type = "schedule"
+
+        try:
+            analyzer = SchemaAnalyzer(
+                paperless=self._paperless,
+                claude=state.claude_client,
+                database=self._database,
+                model=self._settings.schema_matrix_model,
+            )
+
+            run_record = await analyzer.run(trigger_type=trigger_type)
+
+            if run_record.status == "completed":
+                # Prompt-Cache invalidieren → nächste Klassifizierung benutzt neue Regeln
+                self._pipeline.invalidate_prompt_cache()
+                logger.info(
+                    "Schema-Analyse erfolgreich – Prompt-Cache invalidiert "
+                    "(Titel: %d/%d, Pfade: %d/%d, Mappings: %d/%d)",
+                    run_record.title_schemas_created,
+                    run_record.title_schemas_updated,
+                    run_record.path_rules_created,
+                    run_record.path_rules_updated,
+                    run_record.mappings_created,
+                    run_record.mappings_updated,
+                )
+            else:
+                logger.warning(
+                    "Schema-Analyse mit Status '%s' beendet: %s",
+                    run_record.status,
+                    run_record.error_message or "(keine Details)",
+                )
+
+        except Exception as exc:
+            logger.error(
+                "Schema-Analyse unerwarteter Fehler: %s",
                 exc,
                 exc_info=True,
             )

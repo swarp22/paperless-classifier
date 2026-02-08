@@ -54,6 +54,10 @@ class SchemaTrigger:
     async def should_run(self) -> tuple[bool, str]:
         """Prüft alle automatischen Trigger-Bedingungen.
 
+        Verwendet den letzten Analyse-*Versuch* (nicht nur den letzten
+        Erfolg) für den Cooldown-Timer.  Damit wird verhindert, dass
+        fehlgeschlagene Läufe eine Endlosschleife auslösen.  (AP-11)
+
         Returns:
             Tuple (should_run, reason):
             - should_run: True wenn die Analyse ausgelöst werden soll
@@ -63,53 +67,77 @@ class SchemaTrigger:
         if self._settings.schema_matrix_schedule == SchemaMatrixSchedule.MANUAL:
             return (False, "Zeitplan auf 'manual' gesetzt")
 
-        last_run = await self._db.get_last_schema_analysis_run()
+        # Cooldown basiert auf dem letzten VERSUCH (inkl. Fehler)
+        last_attempt = await self._db.get_last_schema_analysis_attempt()
 
         # Noch nie gelaufen → sofort auslösen
-        if last_run is None:
+        if last_attempt is None:
             logger.info(
                 "Schema-Trigger: Noch nie gelaufen – Erstlauf wird ausgelöst",
             )
             return (True, "Erstlauf (noch nie ausgeführt)")
 
-        # Zeitpunkt des letzten Laufs parsen
-        last_run_at = last_run.get("run_at", "")
+        # Zeitpunkt des letzten Versuchs parsen (für Cooldown)
+        attempt_at = last_attempt.get("run_at", "")
         try:
-            last_run_dt = datetime.fromisoformat(last_run_at)
-            # Falls kein Timezone-Info: UTC annehmen
-            if last_run_dt.tzinfo is None:
-                last_run_dt = last_run_dt.replace(tzinfo=timezone.utc)
+            attempt_dt = datetime.fromisoformat(attempt_at)
+            if attempt_dt.tzinfo is None:
+                attempt_dt = attempt_dt.replace(tzinfo=timezone.utc)
         except (ValueError, TypeError):
             logger.warning(
                 "Schema-Trigger: run_at nicht parsbar: '%s' – Erstlauf wird ausgelöst",
-                last_run_at,
+                attempt_at,
             )
             return (True, "Letzter Lauf-Zeitpunkt nicht parsbar")
 
         now = datetime.now(timezone.utc)
-        hours_since_last = (now - last_run_dt).total_seconds() / 3600
+        hours_since_attempt = (now - attempt_dt).total_seconds() / 3600
 
-        # Mindestabstand: N Stunden zwischen automatischen Läufen
+        # Mindestabstand: N Stunden zwischen Versuchen (auch fehlgeschlagenen)
         min_interval = self._settings.schema_matrix_min_interval_h
-        if hours_since_last < min_interval:
+        if hours_since_attempt < min_interval:
+            last_status = last_attempt.get("status", "?")
             return (
                 False,
                 f"Mindestabstand nicht erreicht: "
-                f"{hours_since_last:.1f}h / {min_interval}h",
+                f"{hours_since_attempt:.1f}h / {min_interval}h "
+                f"(letzter Versuch: {last_status})",
             )
 
-        # Trigger 1: Wöchentlicher Zeitplan (≥168h = 7 Tage)
-        if hours_since_last >= 7 * 24:
+        # Ab hier: Cooldown ist abgelaufen, prüfe ob Trigger-Bedingung erfüllt
+
+        # Für Zeitplan und Schwellwert brauchen wir den letzten ERFOLG
+        last_success = await self._db.get_last_schema_analysis_run()
+
+        # Noch nie erfolgreich gelaufen → auslösen
+        if last_success is None:
+            logger.info(
+                "Schema-Trigger: Noch kein erfolgreicher Lauf – wird ausgelöst",
+            )
+            return (True, "Kein erfolgreicher Lauf vorhanden")
+
+        success_at = last_success.get("run_at", "")
+        try:
+            success_dt = datetime.fromisoformat(success_at)
+            if success_dt.tzinfo is None:
+                success_dt = success_dt.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            return (True, "Letzter Erfolg-Zeitpunkt nicht parsbar")
+
+        hours_since_success = (now - success_dt).total_seconds() / 3600
+
+        # Trigger 1: Wöchentlicher Zeitplan (≥168h = 7 Tage seit letztem Erfolg)
+        if hours_since_success >= 7 * 24:
             logger.info(
                 "Schema-Trigger: Wöchentlicher Zeitplan erreicht "
-                "(%.1f Stunden seit letztem Lauf)",
-                hours_since_last,
+                "(%.1f Stunden seit letztem Erfolg)",
+                hours_since_success,
             )
             return (True, "Wöchentlicher Zeitplan")
 
-        # Trigger 2: Schwellwert neue Dokumente
+        # Trigger 2: Schwellwert neue Dokumente (seit letztem Erfolg)
         threshold = self._settings.schema_matrix_threshold
-        docs_since = await self._db.get_documents_processed_since(last_run_at)
+        docs_since = await self._db.get_documents_processed_since(success_at)
 
         if docs_since >= threshold:
             logger.info(
@@ -122,7 +150,7 @@ class SchemaTrigger:
         return (
             False,
             f"Kein Trigger aktiv: "
-            f"{hours_since_last:.1f}h seit Lauf, "
+            f"{hours_since_success:.1f}h seit Erfolg, "
             f"{docs_since}/{threshold} neue Dokumente",
         )
 
@@ -132,7 +160,8 @@ class SchemaTrigger:
         Returns:
             Dict mit Informationen zum Trigger-Zustand.
         """
-        last_run = await self._db.get_last_schema_analysis_run()
+        last_success = await self._db.get_last_schema_analysis_run()
+        last_attempt = await self._db.get_last_schema_analysis_attempt()
         threshold = self._settings.schema_matrix_threshold
 
         status: dict[str, Any] = {
@@ -140,13 +169,21 @@ class SchemaTrigger:
             "threshold": threshold,
             "min_interval_h": self._settings.schema_matrix_min_interval_h,
             "last_run": None,
+            "last_attempt": None,
+            "last_attempt_status": None,
             "docs_since_last_run": 0,
             "threshold_progress_pct": 0.0,
             "next_scheduled": None,
         }
 
-        if last_run:
-            last_run_at = last_run.get("run_at", "")
+        # Letzter Versuch (für Cooldown-Anzeige)
+        if last_attempt:
+            status["last_attempt"] = last_attempt.get("run_at", "")
+            status["last_attempt_status"] = last_attempt.get("status", "?")
+
+        # Letzter Erfolg (für Zeitplan + Schwellwert)
+        if last_success:
+            last_run_at = last_success.get("run_at", "")
             status["last_run"] = last_run_at
 
             docs_since = await self._db.get_documents_processed_since(
@@ -157,16 +194,14 @@ class SchemaTrigger:
                 100.0, (docs_since / threshold) * 100.0,
             )
 
-            # Nächster geplanter Lauf (Sonntag 03:00)
+            # Nächsten geplanter Lauf (Sonntag 03:00)
             try:
                 last_dt = datetime.fromisoformat(last_run_at)
                 if last_dt.tzinfo is None:
                     last_dt = last_dt.replace(tzinfo=timezone.utc)
 
-                # Nächsten Sonntag 03:00 berechnen
                 days_until_sunday = (6 - last_dt.weekday()) % 7
                 if days_until_sunday == 0:
-                    # Wenn letzter Lauf auch Sonntag war, nächsten Sonntag
                     days_until_sunday = 7
                 from datetime import timedelta
                 next_sunday = last_dt.replace(

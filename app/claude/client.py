@@ -180,6 +180,19 @@ class ClassificationResponse(BaseModel):
     stop_reason: str = Field("", description="Grund für Antwort-Ende")
 
 
+class TextMessageResponse(BaseModel):
+    """Antwort einer generischen Text-Nachricht (AP-11).
+
+    Liefert den Rohtext zurück – das Parsing obliegt dem Aufrufer.
+    Wird für Schema-Analyse und andere Nicht-Klassifizierungs-Aufgaben verwendet.
+    """
+
+    text: str = Field(..., description="Roher Antworttext von Claude")
+    usage: TokenUsage
+    model: str = Field("", description="Tatsächlich verwendetes Modell")
+    stop_reason: str = Field("", description="Grund für Antwort-Ende")
+
+
 # ---------------------------------------------------------------------------
 # Claude Client
 # ---------------------------------------------------------------------------
@@ -383,6 +396,160 @@ class ClaudeClient:
             result=result,
             usage=usage,
             raw_response=raw_text,
+            model=message.model,
+            stop_reason=message.stop_reason or "",
+        )
+
+    # --- Generische Text-Nachricht (AP-11: Schema-Analyse u.a.) ---
+
+    async def send_message(
+        self,
+        system_prompt: str,
+        user_message: str,
+        model: str | None = None,
+        max_tokens: int | None = None,
+        enable_cache: bool = True,
+        tracking_label: str | None = None,
+        effort: str | None = None,
+    ) -> "TextMessageResponse":
+        """Sendet einen reinen Text-Prompt an Claude (ohne PDF).
+
+        Generische Methode für Aufgaben jenseits der Dokument-Klassifizierung,
+        z.B. Schema-Analyse mit Opus.  Kosten werden getrackt, das
+        Response-Parsing obliegt dem Aufrufer.
+
+        Args:
+            system_prompt: System-Prompt (wird gecacht bei enable_cache=True).
+            user_message: User-Message als String.
+            model: Modell-Override (None = default_model).
+            max_tokens: Output-Token-Limit (None = self._max_tokens).
+            enable_cache: Prompt Caching für System-Prompt aktivieren.
+            tracking_label: Optionales Label für Logging (z.B. "schema_analysis").
+            effort: Effort-Level für Adaptive Thinking ('low', 'medium', 'high').
+                    None = API-Default (high).  Für strukturierte JSON-Ausgaben
+                    empfohlen: 'low' oder 'medium'.
+
+        Returns:
+            TextMessageResponse mit Rohtext, Token-Verbrauch und Metadaten.
+
+        Raises:
+            ClaudeConfigError: API-Key fehlt.
+            CostLimitReachedError: Monatslimit erreicht.
+            ClaudeAPIError: API-Kommunikationsfehler.
+        """
+        await self._check_cost_limit()
+
+        used_model = model or self._default_model
+        used_max_tokens = max_tokens or self._max_tokens
+        label = tracking_label or "text_message"
+
+        # System-Prompt mit optionalem Cache-Control
+        system_block: dict[str, Any] = {
+            "type": "text",
+            "text": system_prompt,
+        }
+        if enable_cache:
+            system_block["cache_control"] = {"type": "ephemeral"}
+
+        logger.info(
+            "send_message starten: label=%s, model=%s, "
+            "system_len=%d, user_len=%d, max_tokens=%d, effort=%s",
+            label, used_model,
+            len(system_prompt), len(user_message), used_max_tokens,
+            effort or "default",
+        )
+
+        # API-Aufruf – output_config steuert Adaptive Thinking (Opus 4.5/4.6)
+        api_kwargs: dict[str, Any] = {
+            "model": used_model,
+            "max_tokens": used_max_tokens,
+            "system": [system_block],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": user_message,
+                }
+            ],
+        }
+        if effort:
+            api_kwargs["output_config"] = {"effort": effort}
+
+        try:
+            message = await self._client.messages.create(**api_kwargs)
+        except anthropic.APIConnectionError as exc:
+            raise ClaudeAPIError(
+                f"Verbindung zur Claude API fehlgeschlagen: {exc}"
+            ) from exc
+        except anthropic.RateLimitError as exc:
+            raise ClaudeAPIError(
+                "Claude API Rate-Limit erreicht (429). "
+                "Alle Retries erschöpft.",
+                status_code=429,
+            ) from exc
+        except anthropic.APIStatusError as exc:
+            raise ClaudeAPIError(
+                f"Claude API Fehler (HTTP {exc.status_code}): {exc.message}",
+                status_code=exc.status_code,
+            ) from exc
+
+        # Token-Verbrauch extrahieren und aufzeichnen
+        usage = self._extract_usage(message, used_model, document_id=None)
+        if self._cost_tracker:
+            self._cost_tracker.record(usage)
+
+        # Diagnose: Content-Blöcke loggen (AP-11 Debugging)
+        block_types = [getattr(b, "type", "unknown") for b in message.content]
+        logger.info(
+            "send_message Response: stop_reason=%s, blocks=%s, "
+            "content_count=%d",
+            message.stop_reason, block_types, len(message.content),
+        )
+
+        # Text aus ALLEN Text-Blöcken extrahieren (Thinking-Blöcke überspringen)
+        text_parts: list[str] = []
+        for block in message.content:
+            block_type = getattr(block, "type", "unknown")
+            if block_type == "thinking":
+                thinking_len = len(getattr(block, "thinking", ""))
+                logger.debug(
+                    "Thinking-Block übersprungen: %d Zeichen", thinking_len,
+                )
+                continue
+            if hasattr(block, "text") and block.text:
+                text_parts.append(block.text)
+
+        raw_text = "\n".join(text_parts)
+
+        if not raw_text.strip():
+            # Kein nutzbarer Text – detaillierte Diagnose loggen
+            all_content = str(message.content)[:500]
+            logger.error(
+                "send_message: Kein Text in Antwort! "
+                "stop_reason=%s, blocks=%s, output_tokens=%d, "
+                "content_preview=%s",
+                message.stop_reason, block_types,
+                usage.output_tokens, all_content,
+            )
+
+        if message.stop_reason == "max_tokens":
+            logger.warning(
+                "send_message: Antwort bei max_tokens abgeschnitten! "
+                "output_tokens=%d, max_tokens=%d – "
+                "JSON ist möglicherweise unvollständig",
+                usage.output_tokens, used_max_tokens,
+            )
+
+        logger.info(
+            "send_message abgeschlossen: label=%s, model=%s, "
+            "in=%d, out=%d, cost=$%.6f, text_len=%d",
+            label, used_model,
+            usage.input_tokens, usage.output_tokens, usage.cost_usd,
+            len(raw_text),
+        )
+
+        return TextMessageResponse(
+            text=raw_text,
+            usage=usage,
             model=message.model,
             stop_reason=message.stop_reason or "",
         )

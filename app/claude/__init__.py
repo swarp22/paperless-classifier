@@ -26,6 +26,7 @@ from app.claude.client import (
     CostLimitReachedError,
     CreateNew,
     LinkExtraction,
+    TextMessageResponse,
 )
 from app.claude.cost_tracker import (
     CostTracker,
@@ -36,6 +37,7 @@ from app.claude.cost_tracker import (
 )
 from app.claude.prompts import (
     PromptData,
+    build_schema_rules_text,
     build_system_prompt,
     build_user_prompt,
 )
@@ -45,6 +47,7 @@ __all__ = [
     "ClaudeClient",
     "ClassificationResponse",
     "ClassificationResult",
+    "TextMessageResponse",
     "ConfidenceLevel",
     "LinkExtraction",
     "CreateNew",
@@ -64,4 +67,5 @@ __all__ = [
     "PromptData",
     "build_system_prompt",
     "build_user_prompt",
+    "build_schema_rules_text",
 ]

@@ -4,10 +4,17 @@ Baut den System-Prompt dynamisch aus Paperless-Stammdaten (Korrespondenten,
 Dokumenttypen, Tags, Speicherpfade) und dem Klassifizierungs-Regelwerk auf.
 Prompt Caching wird über cache_control gesteuert – der System-Prompt ändert
 sich nur bei Stammdaten-Updates und kann daher gecacht werden.
+
+AP-11: build_schema_rules_text() lädt Schema-Analyse-Ergebnisse aus SQLite
+und formatiert sie als Textblock für den Klassifizierungs-Prompt.
 """
 
 import logging
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.db.database import Database
 
 logger = logging.getLogger(__name__)
 
@@ -299,3 +306,103 @@ def build_user_prompt(extra_context: str | None = None) -> str:
         )
 
     return prompt
+
+
+# ---------------------------------------------------------------------------
+# Schema-Regeln aus SQLite laden (AP-11, Entscheidung 6)
+# ---------------------------------------------------------------------------
+
+async def build_schema_rules_text(database: "Database") -> str | None:
+    """Lädt Schema-Analyse-Ergebnisse aus SQLite und formatiert sie als Textblock.
+
+    Wird von der Pipeline aufgerufen, um schema_analysis_rules in PromptData
+    zu befüllen.  Der formatierte Text wird dann im System-Prompt unter
+    "Erkannte Muster (Schema-Analyse)" eingefügt.
+
+    Args:
+        database: Initialisierte Database-Instanz.
+
+    Returns:
+        Formatierter Regeltext oder None wenn keine Schema-Daten vorhanden.
+    """
+    from app.schema_matrix.storage import SchemaStorage
+
+    storage = SchemaStorage(database)
+
+    # Daten laden
+    title_patterns = await storage.get_all_title_patterns()
+    path_rules = await storage.get_all_path_rules()
+    mappings = await storage.get_all_mappings()
+
+    # Keine Daten → kein Regelblock
+    if not title_patterns and not path_rules and not mappings:
+        return None
+
+    sections: list[str] = []
+
+    # --- Sektion 1: Titel-Schemata ---
+    if title_patterns:
+        lines = ["### Titel-Schemata (verwende diese Templates für bekannte Kombinationen)\n"]
+        for p in title_patterns:
+            conf_marker = f" (Confidence: {p.confidence})" if p.confidence else ""
+            template = p.title_template or "(kein Template)"
+            lines.append(
+                f"- {p.correspondent} + {p.document_type} → "
+                f"\"{template}\"{conf_marker}"
+            )
+            if p.rule_description:
+                lines.append(f"  Regel: {p.rule_description}")
+        sections.append("\n".join(lines))
+
+    # --- Sektion 2: Pfad-Zuordnungen ---
+    if path_rules:
+        lines = ["### Pfad-Regeln (verwende dieses Ordnungsprinzip für Speicherpfade)\n"]
+        for r in path_rules:
+            conf_marker = f" (Confidence: {r.confidence})" if r.confidence else ""
+            template = r.path_template or "(kein Template)"
+            lines.append(f"- Topic \"{r.topic}\": {template}{conf_marker}")
+            if r.rule_description:
+                lines.append(f"  Regel: {r.rule_description}")
+            if r.examples:
+                examples_str = ", ".join(r.examples[:3])
+                lines.append(f"  Beispiele: {examples_str}")
+        sections.append("\n".join(lines))
+
+    # --- Sektion 3: Zuordnungsmatrix ---
+    if mappings:
+        # Gruppieren nach Korrespondent für Lesbarkeit
+        by_correspondent: dict[str, list] = {}
+        for m in mappings:
+            by_correspondent.setdefault(m.correspondent, []).append(m)
+
+        lines = ["### Zuordnungsmatrix (verwende diese Zuordnungen als Orientierung)\n"]
+        for correspondent, entries in sorted(by_correspondent.items()):
+            if len(entries) == 1:
+                e = entries[0]
+                doc_type_note = f" + {e.document_type}" if e.document_type else ""
+                lines.append(
+                    f"- {correspondent}{doc_type_note} → "
+                    f"\"{e.storage_path_name}\" ({e.mapping_type})"
+                )
+            else:
+                lines.append(f"- {correspondent}:")
+                for e in entries:
+                    doc_type_note = f" [{e.document_type}]" if e.document_type else ""
+                    condition = ""
+                    if e.condition_description:
+                        condition = f" – {e.condition_description}"
+                    lines.append(
+                        f"  → \"{e.storage_path_name}\"{doc_type_note}"
+                        f" ({e.mapping_type}){condition}"
+                    )
+        sections.append("\n".join(lines))
+
+    result = "\n\n".join(sections)
+
+    logger.debug(
+        "Schema-Regeln formatiert: %d Zeichen, %d Titel-Schemata, "
+        "%d Pfad-Regeln, %d Mappings",
+        len(result), len(title_patterns), len(path_rules), len(mappings),
+    )
+
+    return result

@@ -10,6 +10,7 @@ Lifecycle:
 4. shutdown()       – Poller stoppen, Clients schließen
 """
 
+import asyncio
 import sys
 from datetime import datetime, timezone
 from typing import Any
@@ -122,6 +123,129 @@ async def health_check() -> dict[str, Any]:
 
 # --- Startup / Shutdown ---
 
+async def _paperless_reconnect_loop(settings: Settings) -> None:
+    """Hintergrund-Task: Versucht periodisch Paperless zu erreichen.
+
+    Wird gestartet wenn der initiale Verbindungsaufbau fehlschlägt
+    (z.B. weil Paperless nach einem Backup noch nicht hochgefahren ist).
+    Bei Erfolg werden alle Clients und der Poller initialisiert.
+
+    (E-033: Startup-Retry bei Paperless-Ausfall)
+    """
+    reconnect_interval = 60.0  # Sekunden zwischen Versuchen
+    attempt = 0
+
+    while state.paperless_client is None:
+        await asyncio.sleep(reconnect_interval)
+        attempt += 1
+
+        client: PaperlessClient | None = None
+        try:
+            from app.paperless.client import PaperlessClient
+
+            client = PaperlessClient(
+                base_url=settings.paperless_url,
+                token=settings.paperless_api_token,
+            )
+            await client.__aenter__()
+            stats = await client.load_cache()
+
+            state.paperless_client = client
+            logger.info(
+                "Paperless-Reconnect erfolgreich nach %d Versuchen: %s",
+                attempt,
+                ", ".join(f"{k}={v}" for k, v in stats.items()),
+            )
+
+            # Jetzt den Rest der Initialisierung nachholen
+            await _initialize_remaining_services(settings)
+            return
+
+        except Exception as exc:
+            logger.warning(
+                "Paperless-Reconnect Versuch %d fehlgeschlagen: %s",
+                attempt, exc,
+            )
+            if client is not None:
+                try:
+                    await client.__aexit__(None, None, None)
+                except Exception:
+                    pass
+
+
+async def _initialize_remaining_services(settings: Settings) -> None:
+    """Initialisiert Claude-Client, Pipeline und Poller.
+
+    Wird sowohl vom normalen Startup als auch vom Reconnect aufgerufen,
+    um Duplikation zu vermeiden.  Prüft ob Services bereits initialisiert
+    sind und überspringt sie gegebenenfalls.
+
+    (E-033: Gemeinsame Init-Logik für Startup und Reconnect)
+    """
+    # --- ClaudeClient + CostTracker ---
+    if state.claude_client is None:
+        if not settings.anthropic_api_key:
+            logger.warning(
+                "ANTHROPIC_API_KEY nicht konfiguriert – "
+                "Poller wird nicht gestartet (Klassifizierung nicht möglich)"
+            )
+            return
+
+        try:
+            from app.claude.client import ClaudeClient
+            from app.claude.cost_tracker import CostTracker
+
+            if state.cost_tracker is None:
+                state.cost_tracker = CostTracker()
+                if state.database:
+                    state.cost_tracker.set_database(state.database)
+
+            state.claude_client = ClaudeClient(
+                api_key=settings.anthropic_api_key,
+                default_model=settings.default_model,
+                cost_tracker=state.cost_tracker,
+                monthly_cost_limit_usd=settings.monthly_cost_limit_usd,
+            )
+            await state.claude_client.__aenter__()
+            logger.info("ClaudeClient initialisiert")
+        except Exception as exc:
+            logger.error("ClaudeClient konnte nicht initialisiert werden: %s", exc)
+            state.claude_client = None
+            return
+
+    # --- Pipeline ---
+    if state.pipeline is None:
+        try:
+            from app.classifier.pipeline import ClassificationPipeline, PipelineConfig
+
+            state.pipeline = ClassificationPipeline(
+                paperless=state.paperless_client,
+                claude=state.claude_client,
+                config=PipelineConfig(),
+                database=state.database,
+            )
+            logger.info("ClassificationPipeline erstellt")
+        except Exception as exc:
+            logger.error("Pipeline konnte nicht erstellt werden: %s", exc)
+            return
+
+    # --- Poller ---
+    if state.poller is None:
+        try:
+            from app.scheduler.poller import Poller
+
+            state.poller = Poller(
+                paperless=state.paperless_client,
+                pipeline=state.pipeline,
+                settings=settings,
+                cost_tracker=state.cost_tracker,
+                database=state.database,
+            )
+            state.poller.start()
+            logger.info("Poller gestartet")
+        except Exception as exc:
+            logger.error("Poller konnte nicht gestartet werden: %s", exc)
+
 def startup() -> None:
     """Wird beim Serverstart ausgeführt – initialisiert Logging und prüft Config.
 
@@ -175,89 +299,79 @@ async def async_startup() -> None:
         state.database = None
         # Kein Return – der Classifier kann ohne DB laufen (Degraded-Modus)
 
-    # --- PaperlessClient ---
-    try:
-        from app.paperless.client import PaperlessClient
+    # --- PaperlessClient (mit Retry bei Verbindungsfehler, E-033) ---
+    paperless_initialized = False
+    max_retry_seconds = 600  # 10 Minuten Gesamtzeit
+    retry_interval = 10.0    # Start: 10 Sekunden
+    max_interval = 60.0      # Deckel: 60 Sekunden
+    total_waited = 0.0
+    attempt = 0
 
-        state.paperless_client = PaperlessClient(
-            base_url=settings.paperless_url,
-            token=settings.paperless_api_token,
-        )
-        await state.paperless_client.__aenter__()
-        logger.info("PaperlessClient initialisiert")
+    while not paperless_initialized and total_waited < max_retry_seconds:
+        attempt += 1
+        try:
+            from app.paperless.client import PaperlessClient
 
-        # Stammdaten-Cache laden (Korrespondenten, Tags, Typen, Pfade)
-        stats = await state.paperless_client.load_cache()
-        logger.info(
-            "Stammdaten-Cache geladen: %s",
-            ", ".join(f"{k}={v}" for k, v in stats.items()),
+            if state.paperless_client is None:
+                state.paperless_client = PaperlessClient(
+                    base_url=settings.paperless_url,
+                    token=settings.paperless_api_token,
+                )
+                await state.paperless_client.__aenter__()
+
+            # Stammdaten-Cache laden (Korrespondenten, Tags, Typen, Pfade)
+            stats = await state.paperless_client.load_cache()
+
+            paperless_initialized = True
+            logger.info("PaperlessClient initialisiert")
+            logger.info(
+                "Stammdaten-Cache geladen: %s",
+                ", ".join(f"{k}={v}" for k, v in stats.items()),
+            )
+        except Exception as exc:
+            if attempt == 1:
+                logger.warning(
+                    "Paperless nicht erreichbar (Versuch %d): %s – "
+                    "Retry mit Backoff (max. %ds)",
+                    attempt, exc, max_retry_seconds,
+                )
+            else:
+                logger.warning(
+                    "Paperless nicht erreichbar (Versuch %d, %.0fs/%ds): %s – "
+                    "nächster Versuch in %.0fs",
+                    attempt, total_waited, max_retry_seconds, exc,
+                    retry_interval,
+                )
+
+            # PaperlessClient aufräumen falls teilweise initialisiert
+            if state.paperless_client is not None:
+                try:
+                    await state.paperless_client.__aexit__(None, None, None)
+                except Exception:
+                    pass
+                state.paperless_client = None
+
+            await asyncio.sleep(retry_interval)
+            total_waited += retry_interval
+            retry_interval = min(retry_interval * 2, max_interval)
+
+    if not paperless_initialized:
+        logger.error(
+            "Paperless nach %ds nicht erreichbar – "
+            "Container läuft im Degraded-Modus (kein Poller). "
+            "Reconnect wird im Hintergrund versucht.",
+            max_retry_seconds,
         )
-    except Exception as exc:
-        logger.error("PaperlessClient konnte nicht initialisiert werden: %s", exc)
         state.paperless_client = None
-        return  # Ohne Paperless-Client kein Poller möglich
-
-    # --- ClaudeClient + CostTracker ---
-    if not settings.anthropic_api_key:
-        logger.warning(
-            "ANTHROPIC_API_KEY nicht konfiguriert – "
-            "Poller wird nicht gestartet (Klassifizierung nicht möglich)"
+        # Hintergrund-Task für periodische Reconnect-Versuche starten
+        asyncio.create_task(
+            _paperless_reconnect_loop(settings),
+            name="paperless-reconnect",
         )
         return
 
-    try:
-        from app.claude.client import ClaudeClient
-        from app.claude.cost_tracker import CostTracker
-
-        state.cost_tracker = CostTracker()
-
-        # DB-Backend für persistente Kostenabfragen (AP-06)
-        if state.database:
-            state.cost_tracker.set_database(state.database)
-
-        state.claude_client = ClaudeClient(
-            api_key=settings.anthropic_api_key,
-            default_model=settings.default_model,
-            cost_tracker=state.cost_tracker,
-            monthly_cost_limit_usd=settings.monthly_cost_limit_usd,
-        )
-        await state.claude_client.__aenter__()
-        logger.info("ClaudeClient initialisiert")
-    except Exception as exc:
-        logger.error("ClaudeClient konnte nicht initialisiert werden: %s", exc)
-        state.claude_client = None
-        return  # Ohne Claude-Client kein Poller möglich
-
-    # --- Pipeline ---
-    try:
-        from app.classifier.pipeline import ClassificationPipeline, PipelineConfig
-
-        state.pipeline = ClassificationPipeline(
-            paperless=state.paperless_client,
-            claude=state.claude_client,
-            config=PipelineConfig(),
-            database=state.database,
-        )
-        logger.info("ClassificationPipeline erstellt")
-    except Exception as exc:
-        logger.error("Pipeline konnte nicht erstellt werden: %s", exc)
-        return
-
-    # --- Poller ---
-    try:
-        from app.scheduler.poller import Poller
-
-        state.poller = Poller(
-            paperless=state.paperless_client,
-            pipeline=state.pipeline,
-            settings=settings,
-            cost_tracker=state.cost_tracker,
-            database=state.database,
-        )
-        state.poller.start()
-        logger.info("Poller gestartet")
-    except Exception as exc:
-        logger.error("Poller konnte nicht gestartet werden: %s", exc)
+    # --- ClaudeClient, Pipeline, Poller (gemeinsame Init-Logik, E-033) ---
+    await _initialize_remaining_services(settings)
 
 
 async def shutdown() -> None:
